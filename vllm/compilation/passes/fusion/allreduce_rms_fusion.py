@@ -748,6 +748,17 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
                 "Falling back to non-fused allreduce.",
                 str(e),
             )
+            # Update the config flag so downstream code (e.g., compile
+            # range computation) doesn't assume the pass is active.
+            config.compilation_config.pass_config.fuse_allreduce_rms = False
+            # Remove the compile range split point that was added for
+            # allreduce fusion during config init, before we knew
+            # multicast was unsupported.
+            split_points = config.compilation_config.compile_ranges_split_points
+            if split_points is not None:
+                raw_max_token_num = max_size // (self.hidden_dim * element_size)
+                with contextlib.suppress(ValueError):
+                    split_points.remove(raw_max_token_num)
             return
 
         global _FI_WORKSPACE
