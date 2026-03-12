@@ -397,5 +397,99 @@ def test_opt_125m_int4wo_model_running_preshuffled_kernel_online_quant(
         assert output
 
 
+@pytest.mark.skipif(not TORCHAO_AVAILABLE, reason="torchao is not available")
+class TestFP8ActivationCapabilityCheck:
+    """Tests for _check_torchao_fp8_activation_capability."""
+
+    def test_fp8_config_on_unsupported_gpu(self):
+        from unittest.mock import patch
+
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+            PerRow,
+        )
+
+        from vllm.model_executor.layers.quantization.torchao import (
+            _check_torchao_fp8_activation_capability,
+        )
+        from vllm.platforms.interface import DeviceCapability
+
+        config = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
+        mock_capability = DeviceCapability(major=7, minor=5)
+
+        with (
+            patch(
+                "vllm.platforms.current_platform.supports_fp8",
+                return_value=False,
+            ),
+            patch(
+                "vllm.platforms.current_platform.get_device_capability",
+                return_value=mock_capability,
+            ),
+            pytest.raises(ValueError, match="compute capability >= 8.9"),
+        ):
+            _check_torchao_fp8_activation_capability(config)
+
+    def test_fp8_config_on_supported_gpu(self):
+        from unittest.mock import patch
+
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+            PerRow,
+        )
+
+        from vllm.model_executor.layers.quantization.torchao import (
+            _check_torchao_fp8_activation_capability,
+        )
+
+        config = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
+
+        with patch(
+            "vllm.platforms.current_platform.supports_fp8",
+            return_value=True,
+        ):
+            _check_torchao_fp8_activation_capability(config)
+
+    def test_non_fp8_activation_config_not_blocked(self):
+        from torchao.quantization import Float8WeightOnlyConfig
+
+        from vllm.model_executor.layers.quantization.torchao import (
+            _check_torchao_fp8_activation_capability,
+        )
+
+        config = Float8WeightOnlyConfig()
+        # Should not raise regardless of GPU capability
+        _check_torchao_fp8_activation_capability(config)
+
+    def test_error_message_includes_current_capability(self):
+        from unittest.mock import patch
+
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+            PerRow,
+        )
+
+        from vllm.model_executor.layers.quantization.torchao import (
+            _check_torchao_fp8_activation_capability,
+        )
+        from vllm.platforms.interface import DeviceCapability
+
+        config = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
+        mock_capability = DeviceCapability(major=7, minor=5)
+
+        with (
+            patch(
+                "vllm.platforms.current_platform.supports_fp8",
+                return_value=False,
+            ),
+            patch(
+                "vllm.platforms.current_platform.get_device_capability",
+                return_value=mock_capability,
+            ),
+            pytest.raises(ValueError, match="7.5"),
+        ):
+            _check_torchao_fp8_activation_capability(config)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
