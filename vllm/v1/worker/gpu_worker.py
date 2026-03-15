@@ -401,9 +401,7 @@ class Worker(WorkerBase):
             profile_torch_peak - profile_result.before_profile.torch_peak
         )
         profile_result.non_kv_cache_memory = (
-            profile_result.non_torch_increase
-            + profile_result.torch_peak_increase
-            + profile_result.weights_memory
+            profile_result.total_consumed + profile_result.torch_peak_increase
         )
 
         cudagraph_memory_estimate_applied = (
@@ -412,7 +410,10 @@ class Worker(WorkerBase):
             else 0
         )
 
-        self.non_torch_memory = profile_result.non_torch_increase
+        self.total_consumed = profile_result.total_consumed
+        self.non_torch_memory = (
+            profile_result.total_consumed - profile_result.weights_memory
+        )
         self.peak_activation_memory = (
             profile_result.torch_peak_increase + cudagraph_memory_estimate_applied
         )
@@ -636,9 +637,8 @@ class Worker(WorkerBase):
             # So leave a small buffer (=150MiB) to avoid OOM.
             redundancy_buffer_memory = 150 * (1 << 20)
             non_kv_cache_memory = (
-                self.model_runner.model_memory_usage
+                self.total_consumed
                 + self.peak_activation_memory
-                + self.non_torch_memory
                 + cuda_graph_memory_bytes
             )
             kv_cache_memory_bytes_to_gpu_limit = (
@@ -659,10 +659,10 @@ class Worker(WorkerBase):
                 f"Desired GPU memory utilization is "
                 f"({self.cache_config.gpu_memory_utilization}, "
                 f"{format_gib(self.requested_memory)} GiB). "
-                f"Actual usage is {format_gib(self.model_runner.model_memory_usage)} "
-                f"GiB for weight, {format_gib(self.peak_activation_memory)} GiB "
-                f"for peak activation, {format_gib(self.non_torch_memory)} GiB "
-                f"for non-torch memory, and {format_gib(cuda_graph_memory_bytes)} "
+                f"Actual usage is {format_gib(self.total_consumed)} "
+                f"GiB for consumed memory (weights + non-torch), "
+                f"{format_gib(self.peak_activation_memory)} GiB "
+                f"for peak activation, and {format_gib(cuda_graph_memory_bytes)} "
                 f"GiB for CUDAGraph memory. Replace gpu_memory_utilization "
                 f"config with `--kv-cache-memory="
                 f"{kv_cache_memory_bytes_to_requested_limit}` "

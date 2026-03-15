@@ -170,6 +170,7 @@ class MemoryProfilingResult:
     non_kv_cache_memory: int = 0
     torch_peak_increase: int = 0
     non_torch_increase: int = 0
+    total_consumed: int = 0
     weights_memory: int = 0
     before_create: MemorySnapshot = field(default_factory=MemorySnapshot)
     profile_time: float = 0.0
@@ -187,8 +188,8 @@ class MemoryProfilingResult:
             f"{format_gib(self.non_kv_cache_memory)}GiB; "
             f"torch peak memory increase: "
             f"{format_gib(self.torch_peak_increase)}GiB; "
-            f"non-torch forward increase memory: "
-            f"{format_gib(self.non_torch_increase)}GiB; "
+            f"total consumed (from mem_get_info): "
+            f"{format_gib(self.total_consumed)}GiB; "
             f"weights memory: {format_gib(self.weights_memory)}GiB."
         )
 
@@ -274,8 +275,17 @@ def memory_profiling(
     result.non_torch_increase = diff_from_create.non_torch_memory
     result.profile_time = diff_profile.timestamp
 
-    non_torch_memory = result.non_torch_increase
-    peak_activation_memory = result.torch_peak_increase
-    result.non_kv_cache_memory = (
-        non_torch_memory + peak_activation_memory + result.weights_memory
+    # total_consumed measures all GPU memory used between before_create and
+    # after_profile via the CUDA driver's mem_get_info(). This is reliable
+    # even when pluggable allocators (e.g. cumem) bypass PyTorch's
+    # memory_reserved() tracking, which can make non_torch_memory negative.
+    result.total_consumed = (
+        result.before_create.free_memory - result.after_profile.free_memory
     )
+
+    # non_kv_cache_memory = total_consumed + torch_peak_increase
+    # - total_consumed covers: weights + non-torch (NCCL, etc.) + persistent
+    #   torch allocations still alive after profiling
+    # - torch_peak_increase covers: transient peak activation memory that was
+    #   freed by profiling time (so not reflected in total_consumed)
+    result.non_kv_cache_memory = result.total_consumed + result.torch_peak_increase
