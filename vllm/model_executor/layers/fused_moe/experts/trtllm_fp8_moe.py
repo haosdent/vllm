@@ -408,6 +408,13 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
     ) -> torch.Tensor:
+        # trtllm_fp8 monolithic kernels do not support autotuning
+        # so skip this kernel during dummy run for autotuning.
+        import vllm.utils.flashinfer as fi_utils
+
+        if fi_utils._is_fi_autotuning:
+            return torch.zeros_like(hidden_states)
+
         if self.quant_config.block_shape is not None:
             return self._apply_per_block(
                 hidden_states,

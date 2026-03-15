@@ -271,6 +271,13 @@ class TrtLlmNvFp4ExpertsMonolithic(
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
     ) -> torch.Tensor:
+        # trtllm_fp4_block_scale_moe does not support autotuning
+        # so skip this kernel during dummy run for autotuning.
+        import vllm.utils.flashinfer as fi_utils
+
+        if fi_utils._is_fi_autotuning:
+            return torch.zeros_like(hidden_states)
+
         assert activation in [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL]
         assert a1q_scale is not None
         assert self.quant_config.w1_scale is not None

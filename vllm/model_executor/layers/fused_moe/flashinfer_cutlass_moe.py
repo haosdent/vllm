@@ -254,6 +254,13 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
+        # flashinfer cutlass MoE does not support autotuning
+        # so skip this kernel during dummy run for autotuning.
+        import vllm.utils.flashinfer as fi_utils
+
+        if fi_utils._is_fi_autotuning:
+            return
+
         from flashinfer.fused_moe.core import ActivationType
 
         activation_str_to_value_map = {

@@ -94,6 +94,13 @@ def flashinfer_fused_moe_bf16(
     routing_method_type: int,
     tune_max_num_tokens: int = 8192,
 ) -> torch.Tensor:
+    # flashinfer bf16 monolithic MoE does not support autotuning
+    # so skip this kernel during dummy run for autotuning.
+    import vllm.utils.flashinfer as fi_utils
+
+    if fi_utils._is_fi_autotuning:
+        return torch.zeros_like(hidden_states)
+
     from vllm.utils.flashinfer import flashinfer_trtllm_bf16_moe
 
     return flashinfer_trtllm_bf16_moe(

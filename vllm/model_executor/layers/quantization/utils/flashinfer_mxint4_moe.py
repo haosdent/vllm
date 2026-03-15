@@ -191,6 +191,13 @@ def flashinfer_trtllm_mxint4_moe(
     e_score_correction_bias: torch.Tensor | None = None,
     routing_method_type: int | None = None,
 ) -> torch.Tensor:
+    # flashinfer mxint4 monolithic MoE does not support autotuning
+    # so skip this kernel during dummy run for autotuning.
+    import vllm.utils.flashinfer as fi_utils
+
+    if fi_utils._is_fi_autotuning:
+        return torch.zeros_like(x)
+
     """
     Apply FlashInfer TensorRT-LLM MxInt4 MoE kernel.
 
