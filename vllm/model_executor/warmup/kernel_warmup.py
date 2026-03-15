@@ -36,6 +36,9 @@ def kernel_warmup(worker: "Worker"):
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
 
+    # GDN (Gated Delta Net) Triton kernel warmup
+    _gdn_warmup(worker)
+
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
     )
@@ -76,6 +79,26 @@ def kernel_warmup(worker: "Worker"):
             force_attention=True,
             create_mixed_batch=True,
         )
+
+
+def _gdn_warmup(worker: "Worker"):
+    """Warm up GDN (Gated Delta Net) Triton kernels.
+
+    Must run AFTER KV cache allocation so that the Triton CUDA module
+    overhead comes from ``gpu_memory_utilization`` headroom instead of
+    reducing available KV cache memory.
+
+    The Triton autotuner cache is process-global, so warming up a single
+    GDN layer is sufficient — all layers share the same kernel configs.
+    """
+    model = worker.get_model()
+    for module in model.modules():
+        if hasattr(module, "_warmup_prefill_kernels"):
+            device = next(module.parameters()).device
+            dtype = next(module.parameters()).dtype
+            dummy = torch.empty(1, device=device, dtype=dtype)
+            module._warmup_prefill_kernels(dummy)
+            break
 
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:

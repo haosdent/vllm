@@ -657,7 +657,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
     def _warmup_prefill_kernels(self, mixed_qkv: torch.Tensor) -> None:
-        """Warm up GDN prefill kernels during V1 profiling.
+        """Warm up GDN prefill kernels.
+
+        Called from ``kernel_warmup()`` **after** KV cache allocation so
+        that the Triton CUDA module overhead comes from the
+        ``gpu_memory_utilization`` headroom instead of reducing the
+        available KV cache memory.
 
         During V1 profile runs, ``_forward_core`` returns early because
         ``attn_metadata`` is ``None``, so the autotuned kernels used by
@@ -762,9 +767,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # V1 profile run — warm up prefill kernels so that
-            # autotuning completes before KV cache allocation.
-            self._warmup_prefill_kernels(mixed_qkv)
+            # V1 profile run — skip GDN kernels.  They will be warmed
+            # up later via kernel_warmup() after KV cache allocation,
+            # so the Triton CUDA module overhead does not reduce the
+            # available KV cache memory.
             return
 
         assert isinstance(attn_metadata, dict)
