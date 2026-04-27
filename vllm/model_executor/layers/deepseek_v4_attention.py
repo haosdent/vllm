@@ -5,6 +5,7 @@ DeepseekV4 MLA Attention Layer
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -28,6 +29,7 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
+    gather_dequant_two_scopes_with_mask,
 )
 
 if TYPE_CHECKING:
@@ -1519,43 +1521,60 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         extra_topk_length: torch.Tensor | None,
     ) -> torch.Tensor:
         """SM80 reference decode: gather-then-dequantise only the topk
-        positions, then dispatch to the split-K attention kernel."""
+        positions, then dispatch to the split-K attention kernel.
+
+        Gather + invalid-mask construction is a single fused kernel per
+        scope (`gather_dequant_two_scopes_with_mask`), writing into a
+        merged ``(B, swa_topk + extra_topk, head_dim)`` output buffer so
+        no torch.cat is needed when both SWA and compressed-KV scopes are
+        present."""
         b, s_q, h_q, d_qk = q.shape
         d_v = self.head_dim
-
-        def gather_scope(
-            kv_cache: torch.Tensor,
-            block_size: int,
-            indices: torch.Tensor,
-            topk_length: torch.Tensor | None,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            indices = indices.reshape(b, s_q, -1)
-            topk = indices.size(-1)
-            gathered = self._gather_dequant_blocked_k_at_indices(
-                kv_cache, indices.reshape(-1), block_size
-            ).view(b, s_q, topk, d_qk)
-            invalid_mask = indices == -1
-            if topk_length is not None:
-                topk_length = topk_length.reshape(b)
-                arange = self._get_arange(topk, invalid_mask.device)
-                invalid_mask |= arange.view(1, 1, topk) >= topk_length.view(b, 1, 1)
-            return gathered, invalid_mask
-
-        gathered_kv, invalid_mask = gather_scope(
-            swa_kv_cache, swa_block_size, swa_indices, swa_topk_length
-        )
-        if extra_kv_cache is not None and extra_indices is not None:
-            extra_gathered, extra_invalid = gather_scope(
-                extra_kv_cache, extra_block_size, extra_indices, extra_topk_length
-            )
-            gathered_kv = torch.cat([gathered_kv, extra_gathered], dim=2)
-            invalid_mask = torch.cat([invalid_mask, extra_invalid], dim=2)
-
-        # No NaN scrub: the FP8 quantiser clamps to +/-448 and the gather
-        # zeroes invalid rows in-place, so the gathered buffer is NaN-free.
         bs = b * s_q
-        gathered_kv_flat = gathered_kv.view(bs, -1, d_qk)
-        invalid_flat = invalid_mask.view(bs, -1)
+
+        # Flatten leading dims to (bs, topk_per_scope) so the kernel can
+        # treat each token as one batch entry.
+        swa_indices_2d = swa_indices.reshape(bs, -1)
+        if extra_indices is not None:
+            extra_indices_2d = extra_indices.reshape(bs, -1)
+        else:
+            extra_indices_2d = None
+
+        gathered_kv_flat, invalid_flat = gather_dequant_two_scopes_with_mask(
+            swa_kv_cache=swa_kv_cache,
+            swa_block_size=swa_block_size,
+            swa_indices=swa_indices_2d,
+            swa_topk_length=swa_topk_length,
+            extra_kv_cache=extra_kv_cache,
+            extra_block_size=extra_block_size,
+            extra_indices=extra_indices_2d,
+            extra_topk_length=extra_topk_length,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+            head_dim=d_qk,
+        )
+
+        if os.environ.get("DSV4_GATHER_VERIFY") == "1":
+            # One-shot side-by-side: run the legacy chain and compare.
+            # Set DSV4_GATHER_VERIFY=1 to enable; off by default. Logs to
+            # /tmp/dsv4_gather_verify.log so it survives multiple TP workers
+            # without interleaving stdout.
+            self._verify_gather(
+                q,
+                swa_kv_cache,
+                swa_block_size,
+                swa_indices,
+                swa_topk_length,
+                extra_kv_cache,
+                extra_block_size,
+                extra_indices,
+                extra_topk_length,
+                gathered_kv_flat,
+                invalid_flat,
+                bs,
+                d_qk,
+            )
+
         # q may arrive non-contiguous from the upstream o_padded[...] slice.
         q_flat = q.view(bs, h_q, d_qk).to(torch.bfloat16).contiguous()
 
@@ -1569,6 +1588,74 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         # Match the prior PyTorch shape: (b, h_q, d_v) for s_q=1.
         return out_flat.view(b, h_q, d_v)
+
+    def _verify_gather(
+        self,
+        q: torch.Tensor,
+        swa_kv_cache: torch.Tensor,
+        swa_block_size: int,
+        swa_indices: torch.Tensor,
+        swa_topk_length: torch.Tensor | None,
+        extra_kv_cache: torch.Tensor | None,
+        extra_block_size: int,
+        extra_indices: torch.Tensor | None,
+        extra_topk_length: torch.Tensor | None,
+        new_gathered: torch.Tensor,
+        new_mask: torch.Tensor,
+        bs: int,
+        d_qk: int,
+    ) -> None:
+        """Run the legacy gather + invalid_mask + cat chain and compare
+        against the fused output. Dumps diff stats and aborts on mismatch
+        so the bug is caught early."""
+        b, s_q = q.shape[0], q.shape[1]
+
+        def _legacy_scope(kv_cache, block_size, indices, topk_length):
+            indices_3d = indices.reshape(b, s_q, -1)
+            topk = indices_3d.size(-1)
+            gathered = self._gather_dequant_blocked_k_at_indices(
+                kv_cache, indices_3d.reshape(-1), block_size
+            ).view(b, s_q, topk, d_qk)
+            mask = indices_3d == -1
+            if topk_length is not None:
+                topk_length = topk_length.reshape(b)
+                ar = torch.arange(topk, device=mask.device)
+                mask = mask | (ar.view(1, 1, topk) >= topk_length.view(b, 1, 1))
+            return gathered, mask
+
+        ref_g, ref_m = _legacy_scope(
+            swa_kv_cache, swa_block_size, swa_indices, swa_topk_length
+        )
+        if extra_kv_cache is not None and extra_indices is not None:
+            ex_g, ex_m = _legacy_scope(
+                extra_kv_cache, extra_block_size, extra_indices, extra_topk_length
+            )
+            ref_g = torch.cat([ref_g, ex_g], dim=2)
+            ref_m = torch.cat([ref_m, ex_m], dim=2)
+
+        ref_g_flat = ref_g.view(bs, -1, d_qk)
+        ref_m_flat = ref_m.view(bs, -1)
+
+        rg = torch.nan_to_num(ref_g_flat.float(), 0.0, 0.0, 0.0)
+        ng = torch.nan_to_num(new_gathered.float(), 0.0, 0.0, 0.0)
+        nan_match = (torch.isnan(ref_g_flat) == torch.isnan(new_gathered)).all().item()
+        g_diff = (rg - ng).abs().max().item()
+        m_diff = (ref_m_flat != new_mask).any().item()
+        m_diff_count = (ref_m_flat != new_mask).sum().item()
+
+        with open("/tmp/dsv4_gather_verify.log", "a") as f:
+            f.write(
+                f"layer={self.prefix} bs={bs} swa={swa_indices.shape} "
+                f"extra={None if extra_indices is None else extra_indices.shape} "
+                f"g_max={g_diff:.3e} nan_match={nan_match} "
+                f"m_diff={m_diff} m_count={m_diff_count}\n"
+            )
+        if (not nan_match) or g_diff > 1e-4 or m_diff:
+            raise RuntimeError(
+                f"DSV4 gather verify mismatch on layer {self.prefix}: "
+                f"g_diff={g_diff} nan_match={nan_match} "
+                f"m_diff={m_diff} m_count={m_diff_count}"
+            )
 
     def _forward_prefill(
         self,

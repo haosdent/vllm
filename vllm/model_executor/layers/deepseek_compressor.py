@@ -345,98 +345,18 @@ class DeepseekCompressor(nn.Module):
 
         from vllm.utils.deep_gemm import use_dsv4_reference_kernels
 
-        if use_dsv4_reference_kernels():
-            # SM80 PyTorch fallback: Triton can't compile tl.float8e4nv.
-            # Route through vllm:: custom ops so cudagraph capture splits
-            # at the call site (the bodies use .any() / .nonzero(), forbidden
-            # during capture).
-            if self.head_dim == 512:
-                torch.ops.vllm.deepseek_v4_compressor_sparse_sm80(
-                    state_cache,
-                    token_to_req_indices,
-                    positions,
-                    slot_mapping,
-                    block_table,
-                    self.norm.weight,
-                    cos_sin_cache,
-                    kv_cache,
-                    k_cache_metadata.slot_mapping,
-                    block_size,
-                    self.rms_norm_eps,
-                    kv_cache.shape[1],
-                    self.head_dim,
-                    state_width,
-                    self.compress_ratio,
-                    self.overlap,
-                    self.rope_head_dim,
-                    448.0,
-                    self._quant_block,
-                    self._token_stride,
-                    self._scale_dim,
-                )
-            elif (
-                self.head_dim == 128
-                and self._fused_kernel
-                is _fused_kv_compress_norm_rope_insert_indexer_attn
-            ):  # noqa: E501
-                torch.ops.vllm.deepseek_v4_compressor_indexer_sm80(
-                    state_cache,
-                    token_to_req_indices,
-                    positions,
-                    slot_mapping,
-                    block_table,
-                    self.norm.weight,
-                    cos_sin_cache,
-                    kv_cache,
-                    k_cache_metadata.slot_mapping,
-                    block_size,
-                    self.rms_norm_eps,
-                    kv_cache.shape[1],
-                    self.head_dim,
-                    state_width,
-                    self.compress_ratio,
-                    self.overlap,
-                    self.rope_head_dim,
-                    448.0,
-                    self._quant_block,
-                    self._token_stride,
-                    self._scale_dim,
-                )
-            else:
-                # MXFP4 indexer compressor doesn't use fp8e4nv (it uses
-                # uint8 + ue8m0). Run the Triton kernel.
-                self._fused_kernel[(num_actual,)](
-                    state_cache,
-                    state_cache.stride(0),
-                    state_cache.stride(1),
-                    token_to_req_indices,
-                    positions,
-                    slot_mapping,
-                    block_table,
-                    block_table.stride(0),
-                    block_size,
-                    self.norm.weight,
-                    self.rms_norm_eps,
-                    cos_sin_cache,
-                    cos_sin_cache.stride(0),
-                    kv_cache,
-                    k_cache_metadata.slot_mapping,
-                    kv_cache.shape[1],
-                    HEAD_SIZE=self.head_dim,
-                    TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
-                    STATE_WIDTH=state_width,
-                    COMPRESS_RATIO=self.compress_ratio,
-                    OVERLAP=self.overlap,
-                    ROPE_HEAD_DIM=self.rope_head_dim,
-                    FP8_MAX=448.0,
-                    QUANT_BLOCK=self._quant_block,
-                    TOKEN_STRIDE=self._token_stride,
-                    SCALE_DIM=self._scale_dim,
-                    KV_BLOCK_STRIDE=kv_cache.stride(0),
-                    num_warps=self._num_warps,
-                    launch_pdl=False,
-                )
-            return
+        # SM80 routes through the same Triton kernels with SOFTWARE_FP8=True
+        # (constexpr branch swaps tl.float8e4nv for the software encoder in
+        # `_encode_e4m3fn_sw`). The kernel handles invalid tokens via per-token
+        # early return, which is cudagraph-safe — no .any()/.nonzero() needed.
+        # MXFP4 kernel doesn't take SOFTWARE_FP8 (uses uint8 nibbles, not fp8).
+        is_mxfp4 = (
+            self._fused_kernel
+            is _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
+        )
+        extra_kwargs = (
+            {} if is_mxfp4 else {"SOFTWARE_FP8": use_dsv4_reference_kernels()}
+        )
 
         self._fused_kernel[(num_actual,)](
             # state cache
@@ -472,6 +392,7 @@ class DeepseekCompressor(nn.Module):
             TOKEN_STRIDE=self._token_stride,
             SCALE_DIM=self._scale_dim,
             KV_BLOCK_STRIDE=kv_cache.stride(0),
+            **extra_kwargs,
             num_warps=self._num_warps,
             launch_pdl=False,
         )

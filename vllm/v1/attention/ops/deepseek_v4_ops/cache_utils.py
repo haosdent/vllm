@@ -715,6 +715,227 @@ def flat_index_dequant_gather_blocked(
     return out
 
 
+@triton.jit
+def _gather_with_mask_kernel(
+    cache_ptr,           # uint8 [n_blocks, block_stride]
+    indices_ptr,         # int64 [B*topk_in]   (per-scope flat indices)
+    topk_lens_ptr,       # int32 [B] or dummy when HAS_TOPK_LENS=False
+    out_ptr,             # bf16 [B, total_topk, head_dim]
+    mask_ptr,            # bool [B, total_topk] (writes True=invalid)
+    n_blocks,
+    block_stride: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    fp8_dim: tl.constexpr,
+    rope_bytes: tl.constexpr,
+    head_dim: tl.constexpr,
+    topk_in: tl.constexpr,         # per-scope topk
+    total_topk: tl.constexpr,      # merged topk (swa_topk + extra_topk)
+    slot_offset: tl.constexpr,     # where this scope's slots start in merged
+    n_quant_blocks: tl.constexpr,
+    quant_block: tl.constexpr,
+    HAS_TOPK_LENS: tl.constexpr,
+):
+    """Gather + per-row dequant + write merged invalid_mask in a single launch.
+
+    Replaces the gather + (indices == -1) + (arange >= topk_lens) + or +
+    (torch.cat) chain in ``_ref_sparse_attn_decode_gather`` with one
+    kernel per scope. Each scope writes into slots
+    [slot_offset, slot_offset + topk_in) of the merged buffer; the SWA
+    case uses slot_offset=0, total_topk=swa_topk+extra_topk; the
+    extra-KV case uses slot_offset=swa_topk."""
+    pid = tl.program_id(0)
+    flat_idx = tl.load(indices_ptr + pid)
+
+    token_id = pid // topk_in
+    slot_in = pid % topk_in
+    dst_slot = slot_offset + slot_in
+    dst_row = token_id * total_topk + dst_slot
+
+    cache_capacity = n_blocks * cache_block_size
+    is_padding = flat_idx == -1
+    is_in_range = (flat_idx >= 0) & (flat_idx < cache_capacity)
+
+    if HAS_TOPK_LENS:
+        topk_len = tl.load(topk_lens_ptr + token_id).to(tl.int64)
+        is_beyond = slot_in.to(tl.int64) >= topk_len
+    else:
+        is_beyond = False
+
+    invalid = is_padding | is_beyond
+    tl.store(mask_ptr + dst_row, invalid)
+
+    safe_idx = tl.where(is_in_range, flat_idx, 0)
+    block_idx = safe_idx // cache_block_size
+    pos_in_block = safe_idx % cache_block_size
+
+    token_data_size = fp8_dim + rope_bytes
+    scale_dim = n_quant_blocks + 1
+
+    block_base = cache_ptr + block_idx.to(tl.int64) * block_stride
+    token_data = block_base + pos_in_block * token_data_size
+    token_scale = (
+        block_base + cache_block_size * token_data_size + pos_in_block * scale_dim
+    )
+
+    out_row = out_ptr + dst_row * head_dim
+
+    for qb in tl.static_range(n_quant_blocks):
+        offsets = qb * quant_block + tl.arange(0, quant_block)
+        offset_mask = offsets < fp8_dim
+        x_u8 = tl.load(token_data + offsets, mask=offset_mask, other=0)
+        x_dequant = _decode_e4m3fn(x_u8)
+        scale_u8 = tl.load(token_scale + qb)
+        scale = tl.exp2(scale_u8.to(tl.float32) - 127.0)
+        x_bf16 = (x_dequant * scale).to(tl.bfloat16)
+        x_bf16 = tl.where(is_in_range, x_bf16, tl.zeros_like(x_bf16))
+        tl.store(out_row + offsets, x_bf16, mask=offset_mask)
+
+    bf16_src = (token_data + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+    out_bf16 = out_row + fp8_dim
+    for j in tl.static_range(rope_bytes // (2 * 16)):
+        chunk_offsets = j * 16 + tl.arange(0, 16)
+        bf16_vals = tl.load(bf16_src + chunk_offsets)
+        bf16_vals = tl.where(is_in_range, bf16_vals, tl.zeros_like(bf16_vals))
+        tl.store(out_bf16 + chunk_offsets, bf16_vals)
+
+
+def gather_dequant_two_scopes_with_mask(
+    swa_kv_cache: torch.Tensor,
+    swa_block_size: int,
+    swa_indices: torch.Tensor,            # (B*S, swa_topk) int64 (or castable)
+    swa_topk_length: torch.Tensor | None,  # (B*S,) or None
+    extra_kv_cache: torch.Tensor | None,
+    extra_block_size: int,
+    extra_indices: torch.Tensor | None,    # (B*S, extra_topk) or None
+    extra_topk_length: torch.Tensor | None,
+    nope_dim: int,
+    rope_dim: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run gather + invalid-mask production for SWA and (optionally) extra
+    KV in two kernel launches that write into a single pre-allocated
+    merged buffer. Replaces the two gather wrappers + ``indices == -1`` +
+    ``arange >= topk_lens`` + ``invalid_mask |=`` + two ``torch.cat``s
+    (8 launches in the dual-scope case, 4 in the SWA-only case) with
+    just one or two launches.
+
+    Both indices tensors must be (..., per-scope-topk); the leading dims
+    flatten to a per-token batch B (= b * s_q on the caller side).
+    Returns ``(gathered_merged (B, total_topk, head_dim) bf16,
+    invalid_mask (B, total_topk) bool)``."""
+    assert nope_dim % 64 == 0
+    assert head_dim == nope_dim + rope_dim
+    n_quant_blocks = nope_dim // 64
+
+    swa_indices_flat = swa_indices.reshape(swa_indices.shape[0], -1)
+    n_tokens, swa_topk = swa_indices_flat.shape
+
+    if extra_indices is not None and extra_kv_cache is not None:
+        extra_indices_flat = extra_indices.reshape(extra_indices.shape[0], -1)
+        assert extra_indices_flat.shape[0] == n_tokens
+        extra_topk = extra_indices_flat.shape[1]
+    else:
+        extra_indices_flat = None
+        extra_topk = 0
+
+    total_topk = swa_topk + extra_topk
+
+    device = swa_kv_cache.device
+    gathered = torch.empty(
+        (n_tokens, total_topk, head_dim), dtype=torch.bfloat16, device=device
+    )
+    invalid_mask = torch.empty(
+        (n_tokens, total_topk), dtype=torch.bool, device=device
+    )
+
+    if n_tokens == 0:
+        return gathered, invalid_mask
+
+    def _to_i64(t: torch.Tensor) -> torch.Tensor:
+        return t if t.dtype == torch.int64 else t.to(torch.int64)
+
+    swa_cache_u8 = (
+        swa_kv_cache.view(torch.uint8)
+        if swa_kv_cache.dtype != torch.uint8
+        else swa_kv_cache
+    )
+    swa_block_stride = swa_cache_u8.stride(0)
+    swa_n_blocks = swa_cache_u8.shape[0]
+    swa_idx64 = _to_i64(swa_indices_flat).reshape(-1)
+
+    swa_lens = swa_topk_length
+    has_swa_lens = swa_lens is not None
+    if has_swa_lens:
+        swa_lens = swa_lens.reshape(n_tokens)
+        if swa_lens.dtype != torch.int32:
+            swa_lens = swa_lens.to(torch.int32)
+    else:
+        swa_lens = torch.empty(0, dtype=torch.int32, device=device)
+
+    _gather_with_mask_kernel[(n_tokens * swa_topk,)](
+        swa_cache_u8,
+        swa_idx64,
+        swa_lens,
+        gathered,
+        invalid_mask,
+        swa_n_blocks,
+        block_stride=swa_block_stride,
+        cache_block_size=swa_block_size,
+        fp8_dim=nope_dim,
+        rope_bytes=rope_dim * 2,
+        head_dim=head_dim,
+        topk_in=swa_topk,
+        total_topk=total_topk,
+        slot_offset=0,
+        n_quant_blocks=n_quant_blocks,
+        quant_block=64,
+        HAS_TOPK_LENS=has_swa_lens,
+    )
+
+    if extra_topk > 0:
+        assert extra_indices_flat is not None
+        assert extra_kv_cache is not None
+        extra_cache_u8 = (
+            extra_kv_cache.view(torch.uint8)
+            if extra_kv_cache.dtype != torch.uint8
+            else extra_kv_cache
+        )
+        extra_block_stride = extra_cache_u8.stride(0)
+        extra_n_blocks = extra_cache_u8.shape[0]
+        extra_idx64 = _to_i64(extra_indices_flat).reshape(-1)
+
+        extra_lens = extra_topk_length
+        has_extra_lens = extra_lens is not None
+        if has_extra_lens:
+            extra_lens = extra_lens.reshape(n_tokens)
+            if extra_lens.dtype != torch.int32:
+                extra_lens = extra_lens.to(torch.int32)
+        else:
+            extra_lens = torch.empty(0, dtype=torch.int32, device=device)
+
+        _gather_with_mask_kernel[(n_tokens * extra_topk,)](
+            extra_cache_u8,
+            extra_idx64,
+            extra_lens,
+            gathered,
+            invalid_mask,
+            extra_n_blocks,
+            block_stride=extra_block_stride,
+            cache_block_size=extra_block_size,
+            fp8_dim=nope_dim,
+            rope_bytes=rope_dim * 2,
+            head_dim=head_dim,
+            topk_in=extra_topk,
+            total_topk=total_topk,
+            slot_offset=swa_topk,
+            n_quant_blocks=n_quant_blocks,
+            quant_block=64,
+            HAS_TOPK_LENS=has_extra_lens,
+        )
+
+    return gathered, invalid_mask
+
+
 def compute_global_topk_indices_and_lens(
     topk_indices: torch.Tensor,
     token_to_req_indices: torch.Tensor,

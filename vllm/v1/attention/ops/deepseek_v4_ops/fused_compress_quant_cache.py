@@ -28,6 +28,79 @@ from .fused_indexer_q import _e2m1_nibble
 
 
 # =============================================================================
+# Software FP8-e4m3fn encoder for SM80 (Triton 3.6 has no tl.float8e4nv there)
+# =============================================================================
+@triton.jit
+def _encode_e4m3fn_sw(x):
+    """fp32 -> uint8 byte matching torch.float8_e4m3fn.
+
+    Bit layout: 1 sign | 4 exp (bias 7) | 3 mantissa. 0x7F/0xFF = NaN;
+    0x7E/0xFE = ±max finite (=448). Round-to-nearest, ties-to-even on
+    both normal and subnormal paths. Caller must clamp |x| <= 448 (NaN
+    inputs encode to 0x7F sign-extended)."""
+    bits = x.to(tl.uint32, bitcast=True)
+    sign = (bits >> 31) & 1
+    abs_bits = bits & 0x7FFFFFFF
+    exp_fp32 = (abs_bits >> 23).to(tl.int32)
+    mant_fp32 = abs_bits & 0x7FFFFF
+
+    is_zero = abs_bits == 0
+    is_inf_or_nan = exp_fp32 == 0xFF
+    is_nan = is_inf_or_nan & (mant_fp32 != 0)
+
+    exp_fp8 = exp_fp32 - 120  # exp_unbiased + 7
+
+    # Normal path: top-3 mantissa bits with RNE.
+    mant_extracted = mant_fp32 >> 20
+    round_bit = (mant_fp32 >> 19) & 1
+    sticky = (mant_fp32 & 0x7FFFF) != 0
+    odd = (mant_extracted & 1) == 1
+    round_up = round_bit & (sticky.to(tl.uint32) | odd.to(tl.uint32))
+    mant_rounded = mant_extracted + round_up
+    carry = mant_rounded == 8
+    exp_after = exp_fp8 + carry.to(tl.int32)
+    mant_after = tl.where(carry, 0, mant_rounded)
+    packed_normal = ((exp_after.to(tl.uint32) & 0xF) << 3) | (mant_after & 0x7)
+
+    # Subnormal path: align implicit-1.m mantissa to fp8 exp=0 (value scale 2^-9).
+    impl_mant = (tl.full((), 1, tl.uint32) << 23) | mant_fp32
+    sub_shift = (141 - exp_fp32).to(tl.uint32)
+    safe_shift = tl.minimum(sub_shift, 31)
+    sub_m_int = impl_mant >> safe_shift
+    sub_round_bit = tl.where(
+        safe_shift >= 1,
+        (impl_mant >> (safe_shift - 1)) & 1,
+        tl.zeros_like(impl_mant),
+    )
+    sticky_mask = tl.where(
+        safe_shift >= 2,
+        (tl.full((), 1, tl.uint32) << (safe_shift - 1)) - 1,
+        tl.zeros_like(impl_mant),
+    )
+    sub_sticky = (impl_mant & sticky_mask) != 0
+    sub_odd = (sub_m_int & 1) == 1
+    sub_round_up = sub_round_bit & (sub_sticky.to(tl.uint32) | sub_odd.to(tl.uint32))
+    sub_m_rounded = sub_m_int + sub_round_up
+    sub_promotes = sub_m_rounded == 8  # rounded up into normal exp=1
+    sub_packed = tl.where(
+        sub_promotes,
+        tl.full((), 0x08, tl.uint32),  # exp=1, mant=0
+        sub_m_rounded & 0x7,            # exp=0, mant=sub_m_rounded
+    )
+
+    # Cap normals at 0x7E (0x7F is NaN).
+    over_max_finite = (exp_after >= 16) | ((exp_after == 15) & (mant_after == 7))
+    packed_normal = tl.where(over_max_finite, 0x7E, packed_normal)
+
+    is_subnormal = exp_fp8 <= 0
+    encoded = tl.where(is_subnormal, sub_packed, packed_normal)
+    encoded = tl.where(is_zero, tl.zeros_like(encoded), encoded)
+    encoded = tl.where(is_nan, tl.full((), 0x7F, tl.uint32), encoded)
+    encoded = encoded | (sign << 7)
+    return encoded.to(tl.uint8)
+
+
+# =============================================================================
 # DeepseekV4 Attention path (head=512, nope=448 FP8 + rope=64 bf16)
 # =============================================================================
 def _gather_compressor_state(
@@ -304,6 +377,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     TOKEN_STRIDE: tl.constexpr,  # 576 for DeepseekV4
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
+    SOFTWARE_FP8: tl.constexpr = False,  # SM80 path — Triton has no native fp8e4nv
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -411,9 +485,12 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_scaled = quant_2d * inv_scales_col
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-    x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
+    x_clamped_flat = tl.reshape(x_clamped, (TRITON_BLOCK_SIZE,))
+    if SOFTWARE_FP8:
+        x_uint8_flat = _encode_e4m3fn_sw(x_clamped_flat)
+    else:
+        x_fp8_flat = x_clamped_flat.to(tl.float8e4nv)
+        x_uint8_flat = x_fp8_flat.to(tl.uint8, bitcast=True)
 
     nope_mask = block < NOPE_HEAD_DIM
     tl.store(fp8_ptr + block, x_uint8_flat, mask=nope_mask)
@@ -604,6 +681,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    SOFTWARE_FP8: tl.constexpr = False,  # SM80 path — Triton has no native fp8e4nv
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -733,8 +811,11 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     x_scaled = result_bf16 * inv_scale
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    if SOFTWARE_FP8:
+        x_uint8 = _encode_e4m3fn_sw(x_clamped)
+    else:
+        x_fp8 = x_clamped.to(tl.float8e4nv)
+        x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
     tl.store(fp8_ptr + block, x_uint8, mask=mask)
 

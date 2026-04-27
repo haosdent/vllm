@@ -101,6 +101,198 @@ def _mhc_softmax_sinkhorn_triton(
 
 
 @triton.jit
+def _mhc_pre_fused_kernel(
+    mixes_ptr,        # (T, hc_mult3) fp32  — output of x @ fn^T
+    residual_ptr,     # (T, hc * h) bf16    — residual_flat viewed flat
+    hc_scale_ptr,     # (3,) fp32
+    hc_base_ptr,      # (hc_mult3,) fp32
+    pre_mix_ptr,      # (T, hc) fp32        — output (consumed by layer_input)
+    post_mix_ptr,     # (T, hc) fp32        — output
+    comb_mix_ptr,     # (T, hc, hc) fp32    — output (post-sinkhorn)
+    n_tokens,
+    hc: tl.constexpr,
+    h: tl.constexpr,
+    hc_mult3: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    rms_eps: tl.constexpr,
+    hc_pre_eps: tl.constexpr,
+    hc_sinkhorn_eps: tl.constexpr,
+    hc_post_mult_value: tl.constexpr,
+    sinkhorn_iters: tl.constexpr,
+):
+    """One program per token. Replaces the SM80 reference variance + double
+    sigmoid + comb-logits-scale + softmax/sinkhorn chain with a single
+    Triton launch. Saves ~17 eager launches per mhc_pre call."""
+    pid = tl.program_id(0).to(tl.int64)
+    if pid >= n_tokens:
+        return
+
+    total = hc * h
+
+    # Pass 1: squared sum of residual_flat[pid] (bf16 -> fp32 exact).
+    res_base = residual_ptr + pid * total
+    sqrsum = tl.zeros((), dtype=tl.float32)
+    for blk_start in range(0, total, BLOCK_H):
+        offs = blk_start + tl.arange(0, BLOCK_H)
+        mask = offs < total
+        vals = tl.load(res_base + offs, mask=mask, other=0.0).to(tl.float32)
+        sqrsum += tl.sum(vals * vals)
+
+    inv_n = 1.0 / total
+    rsqrt_val = 1.0 / tl.sqrt(sqrsum * inv_n + rms_eps)
+
+    # Scalars from hc_scale (length-3 vector).
+    s0 = tl.load(hc_scale_ptr + 0)
+    s1 = tl.load(hc_scale_ptr + 1)
+    s2 = tl.load(hc_scale_ptr + 2)
+
+    hc_idx = tl.arange(0, hc)
+
+    # pre region: mixes[pid, :hc]
+    pre_mixes = tl.load(mixes_ptr + pid * hc_mult3 + hc_idx).to(tl.float32) * rsqrt_val
+    pre_base = tl.load(hc_base_ptr + hc_idx).to(tl.float32)
+    pre_logits = pre_mixes * s0 + pre_base
+    pre_mix = tl.sigmoid(pre_logits) + hc_pre_eps
+    tl.store(pre_mix_ptr + pid * hc + hc_idx, pre_mix)
+
+    # post region: mixes[pid, hc:2hc]
+    post_mixes = (
+        tl.load(mixes_ptr + pid * hc_mult3 + hc + hc_idx).to(tl.float32) * rsqrt_val
+    )
+    post_base = tl.load(hc_base_ptr + hc + hc_idx).to(tl.float32)
+    post_logits = post_mixes * s1 + post_base
+    post_mix = tl.sigmoid(post_logits) * hc_post_mult_value
+    tl.store(post_mix_ptr + pid * hc + hc_idx, post_mix)
+
+    # comb region: mixes[pid, 2hc:] viewed as (hc, hc)
+    rows = tl.arange(0, hc)[:, None]
+    cols = tl.arange(0, hc)[None, :]
+    comb_off2d = pid * hc_mult3 + 2 * hc + rows * hc + cols
+    comb_mixes = tl.load(mixes_ptr + comb_off2d).to(tl.float32) * rsqrt_val
+    comb_base = tl.load(hc_base_ptr + 2 * hc + rows * hc + cols).to(tl.float32)
+    cm = comb_mixes * s2 + comb_base  # (hc, hc) fp32
+
+    # Softmax(axis=1) + iter Sinkhorn — same logic as _mhc_sinkhorn_kernel.
+    row_max = tl.max(cm, axis=1)
+    cm = cm - row_max[:, None]
+    cm = tl.exp(cm)
+    row_sum = tl.sum(cm, axis=1)
+    cm = cm / row_sum[:, None] + hc_sinkhorn_eps
+
+    col_sum = tl.sum(cm, axis=0)
+    cm = cm / (col_sum[None, :] + hc_sinkhorn_eps)
+
+    for _ in range(sinkhorn_iters - 1):
+        row_sum = tl.sum(cm, axis=1)
+        cm = cm / (row_sum[:, None] + hc_sinkhorn_eps)
+        col_sum = tl.sum(cm, axis=0)
+        cm = cm / (col_sum[None, :] + hc_sinkhorn_eps)
+
+    out_off = comb_mix_ptr + pid * hc * hc + rows * hc + cols
+    tl.store(out_off, cm)
+
+
+@triton.jit
+def _mhc_layer_input_kernel(
+    residual_ptr,    # (T, hc, h) bf16
+    pre_mix_ptr,     # (T, hc) fp32
+    out_ptr,         # (T, h) bf16
+    n_tokens,
+    hc: tl.constexpr,
+    h: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """layer_input[t, k] = sum_i pre_mix[t, i] * residual[t, i, k]
+    One program per (token, h-block); pre_mix held in registers."""
+    pid_t = tl.program_id(0).to(tl.int64)
+    pid_hb = tl.program_id(1).to(tl.int64)
+
+    h_off = pid_hb * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = h_off < h
+
+    pre = tl.load(pre_mix_ptr + pid_t * hc + tl.arange(0, hc)).to(tl.float32)
+
+    res_off = (
+        residual_ptr
+        + pid_t * hc * h
+        + tl.arange(0, hc)[:, None] * h
+        + h_off[None, :]
+    )
+    res = tl.load(res_off, mask=h_mask[None, :], other=0.0).to(tl.float32)
+
+    weighted = pre[:, None] * res
+    out = tl.sum(weighted, axis=0).to(tl.bfloat16)
+
+    tl.store(out_ptr + pid_t * h + h_off, out, mask=h_mask)
+
+
+def _mhc_pre_fused_triton(
+    mixes: torch.Tensor,           # (T, hc_mult3) fp32
+    residual_flat: torch.Tensor,   # (T, hc, h) bf16, contiguous
+    hc_scale: torch.Tensor,        # (3,) fp32
+    hc_base: torch.Tensor,         # (hc_mult3,) fp32
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_iters: int,
+    hc: int,
+    h: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n_tokens, hc_mult3 = mixes.shape
+    assert hc_mult3 == hc * 2 + hc * hc
+    assert residual_flat.is_contiguous()
+    assert mixes.is_contiguous()
+
+    pre_mix = torch.empty(n_tokens, hc, dtype=torch.float32, device=mixes.device)
+    post_mix = torch.empty(n_tokens, hc, dtype=torch.float32, device=mixes.device)
+    comb_mix = torch.empty(
+        n_tokens, hc, hc, dtype=torch.float32, device=mixes.device
+    )
+
+    # Variance loop block; total = hc*h is small (16384 for V4-Flash).
+    BLOCK_H_VAR = 1024
+    _mhc_pre_fused_kernel[(n_tokens,)](
+        mixes,
+        residual_flat,
+        hc_scale,
+        hc_base,
+        pre_mix,
+        post_mix,
+        comb_mix,
+        n_tokens=n_tokens,
+        hc=hc,
+        h=h,
+        hc_mult3=hc_mult3,
+        BLOCK_H=BLOCK_H_VAR,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_iters=sinkhorn_iters,
+        num_warps=4,
+    )
+
+    layer_input = torch.empty(
+        n_tokens, h, dtype=torch.bfloat16, device=mixes.device
+    )
+    BLOCK_H_LI = 256 if h >= 256 else 128
+    grid_li = (n_tokens, triton.cdiv(h, BLOCK_H_LI))
+    _mhc_layer_input_kernel[grid_li](
+        residual_flat,
+        pre_mix,
+        layer_input,
+        n_tokens=n_tokens,
+        hc=hc,
+        h=h,
+        BLOCK_H=BLOCK_H_LI,
+        num_warps=4,
+    )
+
+    return post_mix, comb_mix, layer_input
+
+
+@triton.jit
 def _mhc_post_per_token(
     a_ptr,  # comb_res_mix (T, hc, hc) fp32
     b_ptr,  # residual (T, hc, h) bf16
@@ -401,36 +593,28 @@ def mhc_pre(
     fn_flat = fn
 
     if use_dsv4_reference_kernels():
-        # SM80/ROCm reference path: pure-PyTorch fused implementation that
-        # bypasses both DeepGEMM `tf32_hc_prenorm_gemm` (Hopper+ only) and
-        # the tilelang follow-up. Lifted from PR 40871's ROCm branch.
+        # SM80/ROCm reference path: 2 Triton kernels + 1 cuBLAS matmul,
+        # replacing the ~23-launch eager PyTorch chain. Each layer of
+        # DSV4-Flash runs mhc_pre once; the model has 44 layers and decode
+        # may run with MTP=3 (4 tokens/step), so launch-count drop is the
+        # dominant single-request perf lever on SM80.
         x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
         mixes = torch.matmul(x, fn_flat.t())
-        sqrsum = x.square().sum(dim=-1, keepdim=True)
-        mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
 
-        pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-        pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
-
-        post_logits = (
-            mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
-            + hc_base[hc_mult : 2 * hc_mult]
+        residual_flat_c = residual_flat.contiguous()
+        post_mix, comb_mix, layer_input = _mhc_pre_fused_triton(
+            mixes,
+            residual_flat_c,
+            hc_scale,
+            hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_iters=sinkhorn_repeat,
+            hc=hc_mult,
+            h=hidden_size,
         )
-        post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
-
-        comb_logits = mixes[:, 2 * hc_mult :].view(
-            num_tokens, hc_mult, hc_mult
-        ) * hc_scale[2] + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
-        # Fused softmax + Sinkhorn iterations (replaces 1 + 2*(iters-1)
-        # PyTorch sum/div pairs with one Triton kernel — primary mhc_pre
-        # CPU-launch bottleneck on SM80 with sinkhorn_repeat=20).
-        comb_mix = _mhc_softmax_sinkhorn_triton(
-            comb_logits, hc_sinkhorn_eps, sinkhorn_repeat
-        )
-
-        layer_input = torch.sum(
-            pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
-        ).to(torch.bfloat16)
         return (
             post_mix.view(*outer_shape, hc_mult, 1),
             comb_mix.view(*outer_shape, hc_mult, hc_mult),
