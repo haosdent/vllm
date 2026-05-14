@@ -33,6 +33,7 @@ from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vllm_config
@@ -43,6 +44,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -92,6 +94,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerBackend,
+    DeepseekV32IndexerMetadata,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
@@ -640,6 +643,9 @@ class Indexer(nn.Module):
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
         self.softmax_scale = self.head_dim**-0.5
+        # Pre-fold the constant scalar consumed by the Phase 4a fused-Q
+        # kernel so each forward avoids re-multiplying.
+        self.weight_scale_const = self.softmax_scale * (self.n_head**-0.5)
 
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
@@ -690,30 +696,89 @@ class Indexer(nn.Module):
                 positions, q[..., : self.rope_dim], k[..., : self.rope_dim].unsqueeze(1)
             )
         else:
-            q_pe, q_nope = torch.split(
-                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-            )
             # Fused wk + weights_proj: one GEMM, then split
             kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 
-            k = self.k_norm(k)
-            k_pe, k_nope = torch.split(
-                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            # Hoist env reads to locals — `envs.VLLM_USE_TILELANG_FUSED_*`
+            # resolve via lambdas that call `os.environ.get`; reading them
+            # once saves ~4 lookups/layer × 78 layers per token.
+            use_fused_k = envs.VLLM_USE_TILELANG_FUSED_K
+            use_fused_q = envs.VLLM_USE_TILELANG_FUSED_Q
+
+            # K-side pipeline:
+            #   - FUSED_K → TileLang kernel does LayerNorm + NeoX RoPE + FP8
+            #     quant + indexer K cache write; downstream `sparse_attn_indexer`
+            #     was already configured (`skip_k_cache_insert=True`) at init
+            #     so it doesn't double-write.
+            #   - else: stock `k_norm` + split; K's RoPE happens below
+            #     (alongside Q's if FUSED_Q is off, or via a K-only
+            #     `rotary_emb` call inside the FUSED_Q branch).
+            if use_fused_k:
+                # Slot mapping comes from the per-request indexer metadata.
+                # During profile/dummy run the metadata is None — skip the
+                # cache write; downstream handles it.
+                attn_metadata = get_forward_context().attn_metadata
+                if isinstance(attn_metadata, dict):
+                    indexer_meta = attn_metadata.get(self.k_cache.prefix)
+                    assert isinstance(indexer_meta, DeepseekV32IndexerMetadata)
+                    # Pass the full `kw` so the kernel reads only the first
+                    # `head_dim` columns directly — avoids the contiguous
+                    # copy of the column-sliced K (saves ~512 KB/layer at
+                    # prefill, ~40 MB/token across 78 layers).
+                    torch.ops.vllm.tilelang_fused_indexer_k_cache(
+                        kw,
+                        self.head_dim,
+                        positions,
+                        rotary_emb.cos_sin_cache,
+                        self.k_norm.weight,
+                        self.k_norm.bias,
+                        indexer_meta.slot_mapping,
+                        self.k_cache.kv_cache,
+                        float(self.k_norm.eps),
+                    )
+            else:
+                k = self.k_norm(k)
+                k_pe, k_nope = torch.split(
+                    k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+                )
+
+            if use_fused_q:
+                # Phase 4a: TileLang kernel does Q RoPE + FP8 quant + weights ×
+                # q_scale × weight_scale_const for Q.
+                if not use_fused_k:
+                    # K still needs RoPE. RoPE is content-blind, so we call
+                    # `rotary_emb` with K as the "query" arg.
+                    k_pe_4d = k_pe.unsqueeze(1)
+                    rotary_emb(positions, k_pe_4d, None)
+                    k_pe = k_pe_4d.reshape(-1, 1, self.rope_dim)
+                    k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+
+                q_fp8, q_scale, weights = torch.ops.vllm.tilelang_fused_indexer_q(
+                    q,
+                    weights,
+                    positions,
+                    rotary_emb.cos_sin_cache,
+                    float(self.weight_scale_const),
+                )
+                q_scale = q_scale.unsqueeze(-1)
+                return self.indexer_op(hidden_states, q_fp8, k, weights)
+
+            q_pe, q_nope = torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
-
-            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-            # Note: RoPE (NeoX) can introduce extra leading dimensions during
-            # compilation so we need to reshape back to token-flattened shapes
+            if use_fused_k:
+                # K already RoPE'd by 4b; rotate only Q here.
+                rotary_emb(positions, q_pe, None)
+            else:
+                q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+                k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+                k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+            # NeoX RoPE can introduce leading dims during compilation; reshape
+            # back to token-flattened.
             q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-            k_pe = k_pe.reshape(-1, 1, self.rope_dim)
-
-            # `rotary_emb` is shape-preserving; `q_pe` is already
-            # [num_tokens, n_head, rope_dim].
             q = torch.cat([q_pe, q_nope], dim=-1)
-            # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
-            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
@@ -809,6 +874,126 @@ direct_register_custom_op(
     op_func=_min_latency_fused_qkv_a_proj_impl,
     mutates_args=[],
     fake_impl=_min_latency_fused_qkv_a_proj_fake,
+)
+
+
+# ---------- Phase 4a: fused TileLang indexer-Q kernel ----------
+# Replaces this chain in `Indexer.forward`:
+#   rotary_emb(positions, q_pe, ...) -> cat(q_pe, q_nope) -> view ->
+#   per_token_group_quant_fp8(q) -> weights * q_scale * softmax_scale * n_head^-0.5
+# Microbench (A100, GLM-5.1 shapes, see vllm/v1/attention/ops/tilelang_fused_q.py):
+#   N=1     11.8 us TL vs 116.6 us prod chain (9.9x — decode is launch-bound)
+#   N=2048  145.7 us TL vs 195.2 us prod chain (1.34x — prefill compute-bound)
+
+
+def _tilelang_fused_indexer_q_impl(
+    q: torch.Tensor,
+    weights_raw: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weight_scale_const: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from vllm.v1.attention.ops.tilelang_fused_q import tilelang_fused_indexer_q
+
+    return tilelang_fused_indexer_q(
+        q=q,
+        weights_raw=weights_raw,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        weight_scale_const=weight_scale_const,
+    )
+
+
+def _tilelang_fused_indexer_q_fake(
+    q: torch.Tensor,
+    weights_raw: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weight_scale_const: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    N, H, D = q.shape
+    q_fp8 = q.new_empty(N, H, D, dtype=torch.float8_e4m3fn)
+    q_scale = q.new_empty(N, H, dtype=torch.float32)
+    weights = q.new_empty(N, H, dtype=torch.float32)
+    return q_fp8, q_scale, weights
+
+
+direct_register_custom_op(
+    op_name="tilelang_fused_indexer_q",
+    op_func=_tilelang_fused_indexer_q_impl,
+    # Inputs aren't mutated. Outputs come from a module-level `_BUFFER_CACHE`
+    # for cudagraph pointer stability — same address across all replays of
+    # the same `(shape, dtype, device)` bucket. Safe under PIECEWISE+FULL
+    # cudagraph because the next op in line (`sparse_attn_indexer`) is a
+    # splitting_ops boundary that consumes the outputs synchronously; no
+    # inductor reordering can land in between.
+    mutates_args=[],
+    fake_impl=_tilelang_fused_indexer_q_fake,
+)
+
+
+# ---------- Phase 4b stage 2: fused TileLang indexer-K kernel ----------
+# Replaces this chain in `Indexer.forward` + downstream `sparse_attn_indexer`:
+#   k = self.k_norm(k)                              # LayerNorm
+#   k_pe, k_nope = torch.split(k, ...)              # view-only
+#   _, k_pe = rotary_emb(positions, _, k_pe.unsqueeze(1))  # NeoX RoPE
+#   k = torch.cat([k_pe, k_nope], dim=-1)           # layout
+#   ops.indexer_k_quant_and_cache(k, kv_cache, slot_mapping, ...)  # CUDA op
+# Microbench (A100, N=1024, D=128, rope_dim=64, block_size=64):
+#   TileLang fused (norm+RoPE+quant+cache):   7.9 us
+#   Production chain (rotary_emb + quant+cache):  117.2 us
+#   speedup:                                  14.88x
+# Correctness: FP8 dequant matches within 1 ULP (the inherent quantization
+# precision); see vllm/v1/attention/ops/tilelang_fused_k.py docstring.
+
+
+def _tilelang_fused_indexer_k_cache_impl(
+    kw: torch.Tensor,
+    head_dim: int,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    eps: float,
+) -> None:
+    from vllm.v1.attention.ops.tilelang_fused_k import (
+        tilelang_fused_indexer_k_cache,
+    )
+
+    tilelang_fused_indexer_k_cache(
+        kw=kw,
+        head_dim=head_dim,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        gamma=gamma,
+        beta=beta,
+        slot_mapping=slot_mapping,
+        kv_cache=kv_cache,
+        eps=eps,
+    )
+
+
+def _tilelang_fused_indexer_k_cache_fake(
+    kw: torch.Tensor,
+    head_dim: int,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    eps: float,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="tilelang_fused_indexer_k_cache",
+    op_func=_tilelang_fused_indexer_k_cache_impl,
+    mutates_args=["kv_cache"],
+    fake_impl=_tilelang_fused_indexer_k_cache_fake,
 )
 
 

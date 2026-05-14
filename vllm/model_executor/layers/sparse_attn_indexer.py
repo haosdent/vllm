@@ -25,9 +25,10 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
-from vllm.v1.attention.ops.mqa_logits_triton import (
-    fp8_mqa_logits_triton,
-    fp8_paged_mqa_logits_triton,
+from vllm.v1.attention.ops.mqa_logits_triton import fp8_paged_mqa_logits_triton
+from vllm.v1.attention.ops.sparse_mla_dispatch import (
+    fp8_mqa_logits,
+    persistent_topk,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -42,6 +43,18 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+# Platform/runtime constants — hoisted to module level so the per-layer hot
+# path in `sparse_attn_indexer` avoids ~5 method calls per invocation
+# (×78 layers × N tokens). Profile showed `sparse_attn_indexer` at 200 µs
+# Self CPU / call, dominated by Python attribute access; these account for a
+# measurable chunk of that.
+_FP8_DTYPE = current_platform.fp8_dtype()
+_IS_CUDA = current_platform.is_cuda()
+_IS_XPU = current_platform.is_xpu()
+# `is_deep_gemm_supported()` interrogates the device arch + checks if the
+# deepgemm package is importable. Both are constant for a process.
+_IS_DEEP_GEMM = is_deep_gemm_supported()
 
 
 def _gather_workspace_shapes(
@@ -105,11 +118,15 @@ def sparse_attn_indexer(
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
-    fp8_dtype = current_platform.fp8_dtype()
+    fp8_dtype = _FP8_DTYPE
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
-    # assert isinstance(attn_metadata, dict)
-    if not isinstance(attn_metadata, dict):
+    # In production `attn_metadata` is a dict keyed by layer name; during the
+    # profile-time dummy run it is None. Compare against the exact None
+    # sentinel rather than `not isinstance(dict)` — both reach the same branch
+    # but the `is None` check is a single C-level identity compare vs an
+    # isinstance dispatch.
+    if attn_metadata is None:
         # Reserve workspace for indexer during profiling run
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
@@ -224,7 +241,7 @@ def sparse_attn_indexer(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            if is_deep_gemm_supported():
+            if _IS_DEEP_GEMM:
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
                     (k_quant_cast, k_scale_cast),
@@ -239,7 +256,7 @@ def sparse_attn_indexer(
                 assert not use_fp4_cache, (
                     "Triton sparse-MLA fallback does not support FP4 KV cache"
                 )
-                logits = fp8_mqa_logits_triton(
+                logits = fp8_mqa_logits(
                     q_slice_cast,
                     (k_quant_cast, k_scale_cast),
                     weights[chunk.token_start : chunk.token_end],
@@ -253,7 +270,7 @@ def sparse_attn_indexer(
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
 
-            if current_platform.is_xpu():
+            if _IS_XPU:
                 xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
                     logits,
                     chunk.cu_seqlen_ks,
@@ -326,7 +343,7 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if is_deep_gemm_supported():
+        if _IS_DEEP_GEMM:
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
@@ -361,12 +378,12 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):
+        if _IS_CUDA and topk_tokens in (512, 1024, 2048):
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
             )
-            torch.ops._C.persistent_topk(
+            persistent_topk(
                 logits,
                 seq_lens,
                 topk_indices,
@@ -375,7 +392,7 @@ def sparse_attn_indexer(
                 attn_metadata_narrowed.max_seq_len,
             )
         else:
-            if current_platform.is_xpu():
+            if _IS_XPU:
                 xpu_ops.top_k_per_row_decode(  # type: ignore[attr-defined]
                     logits,
                     next_n,
@@ -477,8 +494,24 @@ class SparseAttnIndexer(CustomOp):
         self.max_model_len = max_model_len
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
-        self.skip_k_cache_insert = skip_k_cache_insert
+        # Phase 4b stage 2: when the fused indexer-K kernel is on it does
+        # the FP8 quant + cache write itself, so the C++ op call inside
+        # `sparse_attn_indexer` must skip its own write to avoid clobbering.
+        # Gate to CUDA only — ROCm has its own `forward_hip` path that
+        # asserts `not skip_k_cache_insert`, so leaving the flag on there
+        # would crash with a misleading message.
+        import vllm.envs as envs
+
+        fused_k_env = envs.VLLM_USE_TILELANG_FUSED_K and _IS_CUDA
+        self.skip_k_cache_insert = skip_k_cache_insert or fused_k_env
         self.use_fp4_cache = use_fp4_cache
+        # Hoist `_encode_layer_name(prefix)` to init — the encoded layer name
+        # is a constant per-Indexer; computing it once instead of every
+        # forward saves a small but predictable amount of Python work per
+        # call × 78 layers. We deliberately do NOT cache `k_cache.kv_cache`
+        # here: it's lazily allocated by vLLM's KVCache machinery after
+        # `__init__` runs, so caching at init would capture a stale tensor.
+        self._encoded_layer_name = _encode_layer_name(self.k_cache.prefix)
         # On SM80/SM121 (A100, GB10) DeepGEMM is unavailable — fall back to
         # the Triton sparse-MLA path. is_deep_gemm_supported() encodes the
         # SM-arch + has_deep_gemm() gate; if not supported, downgrade the
@@ -522,7 +555,7 @@ class SparseAttnIndexer(CustomOp):
             q_values, q_scale = q_quant, None
         return torch.ops.vllm.sparse_attn_indexer(
             hidden_states,
-            _encode_layer_name(self.k_cache.prefix),
+            self._encoded_layer_name,
             self.k_cache.kv_cache,
             q_values,
             q_scale,

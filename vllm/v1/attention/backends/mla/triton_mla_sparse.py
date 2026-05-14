@@ -17,9 +17,10 @@ from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
     XPUMLASparseMetadata,
     XPUMLASparseMetadataBuilder,
 )
-from vllm.v1.attention.ops.mqa_logits_triton import (
-    warmup_fp8_mqa_logits_triton,
-    warmup_fp8_paged_mqa_logits_triton,
+from vllm.v1.attention.ops.sparse_mla_dispatch import (
+    is_tilelang_mla_enabled,
+    sparse_mla_attention,
+    warmup_indexer_kernels,
 )
 from vllm.v1.attention.ops.triton_sparse_mla_kernel import (
     _DIM_QK,
@@ -64,35 +65,36 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             return
         device = self.topk_indices_buffer.device
         topk = self.topk_indices_buffer.shape[-1]
-        q = torch.empty(1, self.num_heads, _DIM_QK, dtype=torch.bfloat16, device=device)
-        kv = torch.empty(64, 1, _DIM_QK, dtype=torch.bfloat16, device=device)
-        indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)
-        for splits in KV_SPLITS_CANDIDATES:
-            triton_sparse_mla_attention(
-                q,
-                kv,
-                indices,
-                sm_scale=self.softmax_scale,
-                num_kv_splits=splits,
-                sm_count=self._sm_count,
+        # Triton autotune sweep — skip when TileLang is selected (TileLang
+        # has no per-shape autotune sweep; first call JIT-compiles once).
+        if not is_tilelang_mla_enabled():
+            q = torch.empty(
+                1, self.num_heads, _DIM_QK, dtype=torch.bfloat16, device=device
             )
+            kv = torch.empty(64, 1, _DIM_QK, dtype=torch.bfloat16, device=device)
+            indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)
+            for splits in KV_SPLITS_CANDIDATES:
+                triton_sparse_mla_attention(
+                    q,
+                    kv,
+                    indices,
+                    sm_scale=self.softmax_scale,
+                    num_kv_splits=splits,
+                    sm_count=self._sm_count,
+                )
         # GLM-5.1-NVFP4 ships `index_n_heads=32` while V3.2 indexers don't
         # expose `n_head` at all (default to 64). Warmup autotune is keyed on
         # (num_heads, head_dim); priming the wrong shape forces the first real
         # request to re-run the autotune sweep.
         indexer_num_heads = getattr(indexer, "n_head", _INDEXER_NUM_HEADS)
         indexer_head_dim = getattr(indexer, "head_dim", _INDEXER_HEAD_DIM)
-        warmup_fp8_mqa_logits_triton(
-            num_heads=indexer_num_heads, head_dim=indexer_head_dim, device=device
-        )
         cfg = get_current_vllm_config_or_none()
-        if cfg is not None:
-            warmup_fp8_paged_mqa_logits_triton(
-                num_heads=indexer_num_heads,
-                head_dim=indexer_head_dim,
-                block_size=cfg.cache_config.block_size,
-                device=device,
-            )
+        warmup_indexer_kernels(
+            num_heads=indexer_num_heads,
+            head_dim=indexer_head_dim,
+            block_size=cfg.cache_config.block_size if cfg is not None else None,
+            device=device,
+        )
 
     def _forward_bf16_kv(
         self,
@@ -106,7 +108,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
         topk_indices = topk_indices.view(num_tokens, 1, -1)
-        output = triton_sparse_mla_attention(
+        output = sparse_mla_attention(
             q,
             kv_c_and_k_pe_cache,
             topk_indices,

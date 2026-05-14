@@ -98,6 +98,12 @@ if TYPE_CHECKING:
     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
     VLLM_LORA_RESOLVER_HF_REPO_LIST: str | None = None
     VLLM_USE_AOT_COMPILE: bool = False
+    VLLM_USE_TILELANG_SPARSE: bool = False
+    VLLM_USE_TILELANG_SPARSE_MLA: bool = False
+    VLLM_USE_TILELANG_SPARSE_MQA: bool = False
+    VLLM_USE_TILELANG_SPARSE_TOPK: bool = False
+    VLLM_USE_TILELANG_FUSED_Q: bool = False
+    VLLM_USE_TILELANG_FUSED_K: bool = False
     VLLM_USE_BYTECODE_HOOK: bool = True
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
@@ -639,6 +645,51 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compilation is done in warmup phase and the compilation will be
     # reused in subsequent calls.
     "VLLM_USE_AOT_COMPILE": use_aot_compile,
+    # Master switch: opt in to the TileLang sparse-MLA kernels behind
+    # `TRITON_MLA_SPARSE`. Default off keeps the runtime on the Triton
+    # / CUDA path that PR #38476 ships. The three per-kernel switches
+    # below override this for individual kernels (useful for A/B
+    # bisection of which TileLang kernel is causing a regression).
+    "VLLM_USE_TILELANG_SPARSE": lambda: os.environ.get("VLLM_USE_TILELANG_SPARSE", "0")
+    == "1",
+    "VLLM_USE_TILELANG_SPARSE_MLA": lambda: os.environ.get(
+        "VLLM_USE_TILELANG_SPARSE_MLA",
+        os.environ.get("VLLM_USE_TILELANG_SPARSE", "0"),
+    )
+    == "1",
+    "VLLM_USE_TILELANG_SPARSE_MQA": lambda: os.environ.get(
+        "VLLM_USE_TILELANG_SPARSE_MQA",
+        os.environ.get("VLLM_USE_TILELANG_SPARSE", "0"),
+    )
+    == "1",
+    # TopK is independent: the CUDA `persistent_topk` kernel
+    # (vllm-project/vllm#37421) is already optimal and gives ~8% better
+    # decode TPOT than the TileLang radix variant on GLM-5.1. The
+    # TileLang version stays in tree as a fusion substrate for future
+    # work but is off by default even when the master flag is set.
+    "VLLM_USE_TILELANG_SPARSE_TOPK": lambda: os.environ.get(
+        "VLLM_USE_TILELANG_SPARSE_TOPK", "0"
+    )
+    == "1",
+    # Phase 4a: fused TileLang indexer-Q kernel (RoPE + FP8 quant +
+    # weights scaling). Independent of the sparse-MLA backend flags —
+    # safe to enable on the Triton path too, since it replaces a chain
+    # of ops on the Indexer Q side that's identical in both backends.
+    # Inherits from the master flag by default.
+    "VLLM_USE_TILELANG_FUSED_Q": lambda: os.environ.get(
+        "VLLM_USE_TILELANG_FUSED_Q",
+        os.environ.get("VLLM_USE_TILELANG_SPARSE", "0"),
+    )
+    == "1",
+    # Phase 4b stage 1: fused TileLang indexer-K kernel (LayerNorm +
+    # NeoX RoPE). Replaces the k_norm + rotary_emb + cat chain on the
+    # Indexer K side; cache write still uses the existing CUDA op
+    # `indexer_k_quant_and_cache` (stage 2 candidate to fuse).
+    "VLLM_USE_TILELANG_FUSED_K": lambda: os.environ.get(
+        "VLLM_USE_TILELANG_FUSED_K",
+        os.environ.get("VLLM_USE_TILELANG_SPARSE", "0"),
+    )
+    == "1",
     # Feature flag to enable/disable bytecode in
     # TorchCompileWithNoGuardsWrapper.
     "VLLM_USE_BYTECODE_HOOK": lambda: bool(
