@@ -9,7 +9,7 @@ from vllm.multimodal.video import sample_frames_from_video
 from vllm.platforms import current_platform
 
 from ....conftest import IMAGE_ASSETS, VIDEO_ASSETS
-from ....utils import create_new_process_for_each_test
+from ....utils import create_new_process_for_each_test, large_gpu_mark
 from .vlm_utils.builders import sample_frames_with_video_metadata
 
 
@@ -101,6 +101,7 @@ MODEL_CONFIGS: dict[str, VitCudagraphTestConfig] = {
         model="stepfun-ai/Step3-VL-10B",
         image_prompt=step3_vl_chat_template("What is in this image?"),
         video_prompt=None,
+        marks=[large_gpu_mark(min_gb=32)],
     ),
 }
 
