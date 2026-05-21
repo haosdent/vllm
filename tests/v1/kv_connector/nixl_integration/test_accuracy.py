@@ -6,13 +6,16 @@ import lm_eval
 import openai
 
 BASE_URL = "http://localhost:8192/v1"
-NUM_CONCURRENT = 100
+# [D43301] Sequential execution to make L4 and A30 logs comparable
+# step-by-step. Bug may not reproduce at concurrent=1 -- if so we know
+# concurrency is involved and re-run with larger concurrency.
+NUM_CONCURRENT = 1
 TASK = "gsm8k"
 FILTER = "exact_match,strict-match"
-# TODO(#43186): Widened from 0.03 to absorb chunk_scan/SSU numeric jitter
-# on granite-4.0-h-tiny under NIXL PD; tighten when the kernel divergence
-# is fixed.
-RTOL = 0.05
+RTOL = 0.03
+# [D43301] Limit to N prompts so logs are scannable. 50 still has enough
+# samples to see L4 drop pattern if it's per-prompt-deterministic.
+GSM8K_LIMIT = 50
 
 # Model-specific expected values
 EXPECTED_VALUES = {
@@ -22,7 +25,7 @@ EXPECTED_VALUES = {
     "deepseek-ai/DeepSeek-V2-Lite-Chat": 0.65,
     "google/gemma-3-4b-it": 0.74,
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8": 0.84,
-    "ibm-granite/granite-4.0-h-tiny": 0.77,
+    "ibm-granite/granite-4.0-h-tiny": 0.80,
     "Qwen/Qwen3.5-0.8B": 0.33,
 }
 
@@ -59,17 +62,25 @@ def test_accuracy():
         model="local-completions",
         model_args=model_args,
         tasks=TASK,
+        limit=GSM8K_LIMIT,
+        # [D43301] force greedy so chosen=top1; otherwise sampler picks
+        # stochastically and we can't compare L4/A30 chosen-token streams.
+        gen_kwargs="temperature=0,do_sample=False,top_k=1",
     )
 
     measured_value = results["results"][TASK][FILTER]
     expected_value = EXPECTED_VALUES.get(MODEL_NAME)
+
+    print(
+        f"[D43301-RESULT] model={MODEL_NAME} expected={expected_value} "
+        f"measured={measured_value}"
+    )
 
     if expected_value is None:
         print(
             f"Warning: No expected value found for {MODEL_NAME}. "
             "Skipping accuracy check."
         )
-        print(f"Measured value: {measured_value}")
         return
 
     assert (

@@ -2,8 +2,86 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os as _d43301_os
+
 import torch
 from torch import nn
+
+# [D43301] one-time printer + counter for issue #43301 mixer-internal probe.
+_D43301_INIT_DONE = False
+_D43301_MIXER_SEEN = 0
+_D43301_MIXER_LIMIT = int(_d43301_os.environ.get("VLLM_D43301_MIXER_N", "2000"))
+
+
+def _d43301_init_once():
+    global _D43301_INIT_DONE
+    if _D43301_INIT_DONE:
+        return
+    _D43301_INIT_DONE = True
+    try:
+        cap = torch.cuda.get_device_capability()
+        name = torch.cuda.get_device_name(0)
+        import triton as _triton
+
+        print(
+            f"[D43301-INIT] gpu={name} sm={cap[0]}.{cap[1]} "
+            f"torch={torch.__version__} triton={_triton.__version__} "
+            f"pid={_d43301_os.getpid()} mixer_n={_D43301_MIXER_LIMIT}",
+            flush=True,
+        )
+    except Exception as _e:
+        print(f"[D43301-INIT] init failed: {_e}", flush=True)
+
+
+def _d43301_tstat(t):
+    """Short stats for a tensor: shape, dtype, abs-sum (fp32), max-abs (fp32)."""
+    if t is None:
+        return "None"
+    try:
+        f = t.detach().float()
+        return (
+            f"shape={tuple(t.shape)} dtype={t.dtype} "
+            f"abs_sum={f.abs().sum().item():.6e} max_abs={f.abs().max().item():.6e} "
+            f"mean={f.mean().item():.6e}"
+        )
+    except Exception as _e:
+        return f"<stat err: {_e}>"
+
+
+def _d43301_log_mixer(prefix, point, t):
+    """[D43301-MIXER] log a mixer-internal hidden state, bounded by LIMIT."""
+    global _D43301_MIXER_SEEN
+    if _D43301_MIXER_SEEN >= _D43301_MIXER_LIMIT:
+        return
+    try:
+        print(
+            f"[D43301-MIXER] seq={_D43301_MIXER_SEEN} prefix={prefix} "
+            f"point={point} {_d43301_tstat(t)}",
+            flush=True,
+        )
+        _D43301_MIXER_SEEN += 1
+    except Exception as _e:
+        print(f"[D43301-MIXER] err: {_e}", flush=True)
+
+
+def _d43301_log_shadow(prefix, op, bf16_out, fp32_ref):
+    """[D43301-SHADOW] compare bf16 op output against fp32 reference."""
+    global _D43301_MIXER_SEEN
+    if _D43301_MIXER_SEEN >= _D43301_MIXER_LIMIT:
+        return
+    try:
+        diff = (bf16_out.float() - fp32_ref.float()).abs()
+        print(
+            f"[D43301-SHADOW] seq={_D43301_MIXER_SEEN} prefix={prefix} op={op} "
+            f"diff_max={diff.max().item():.6e} diff_mean={diff.mean().item():.6e} "
+            f"diff_ndiff={(diff > 0).sum().item()}/{diff.numel()} "
+            f"bf16_out[{_d43301_tstat(bf16_out)}] "
+            f"fp32_ref[{_d43301_tstat(fp32_ref)}]",
+            flush=True,
+        )
+    except Exception as _e:
+        print(f"[D43301-SHADOW] err: {_e}", flush=True)
+
 
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -532,8 +610,26 @@ class MambaMixer2(MambaBase, PluggableLayer):
         hidden_states: torch.Tensor,
         mup_vector: torch.Tensor | None = None,
     ):
-        # 1. Gated MLP's linear projection
-        projected_states, _ = self.in_proj(hidden_states)
+        # [D43301] mixer-internal probe init
+        _d43301_init_once()
+        _d43301_log_mixer(self.prefix, "in", hidden_states)
+
+        # [D43301] hypothesis test: force fp32 in_proj to bypass cuBLAS bf16
+        # GEMM hardware-specific heuristic.
+        # Default OFF: SHADOW evidence points at out_proj, not in_proj.
+        _d43301_force_fp32_in = int(_d43301_os.environ.get("VLLM_D43301_FORCE_FP32_IN", "0"))
+        if _d43301_force_fp32_in:
+            with torch.no_grad():
+                _w = self.in_proj.weight.float()
+                projected_states = torch.nn.functional.linear(hidden_states.float(), _w)
+                _b = getattr(self.in_proj, "bias", None)
+                if _b is not None:
+                    projected_states = projected_states + _b.float()
+                projected_states = projected_states.to(hidden_states.dtype)
+        else:
+            # 1. Gated MLP's linear projection
+            projected_states, _ = self.in_proj(hidden_states)
+        _d43301_log_mixer(self.prefix, "post_in_proj", projected_states)
         if mup_vector is not None:
             projected_states = projected_states * mup_vector
 
@@ -555,16 +651,69 @@ class MambaMixer2(MambaBase, PluggableLayer):
             ssm_output,
             _encode_layer_name(self.prefix),
         )
+        _d43301_log_mixer(self.prefix, "post_ssm_op", ssm_output)
 
         # 4. gated MLP
         # GatedRMSNorm internally applying SiLU to the gate
         # SiLU is applied internally before normalization, unlike standard
         # norm usage
         gate = projected_states[..., : self.tped_intermediate_size]
+
+        # [D43301-SHADOW] fp32 reference RMSNormGated for direct bf16 vs fp32 compare.
+        # Skip under TP>1: fp32 ref computation requires gathered weights/inputs
+        # to be meaningful, and per-rank fp32 ref tensors cause OOM under TP=2
+        # for granite-tiny on 24GB cards.
+        _d43301_shadow_norm_ref = None
+        if (
+            int(_d43301_os.environ.get("VLLM_D43301_SHADOW", "1"))
+            and getattr(self.out_proj, "tp_size", 1) == 1
+            and _D43301_MIXER_SEEN < _D43301_MIXER_LIMIT
+        ):
+            try:
+                with torch.no_grad():
+                    _g32 = gate.float()
+                    _s32 = ssm_output.float()
+                    _silu = _g32 * torch.sigmoid(_g32)
+                    _x32 = _s32 * _silu
+                    if self.norm.use_rms_norm and self.norm.n_groups == 1:
+                        _var = _x32.pow(2).mean(dim=-1, keepdim=True)
+                        _x32 = _x32 * torch.rsqrt(_var + self.norm.variance_epsilon)
+                        if self.norm.weight is not None:
+                            _x32 = _x32 * self.norm.weight.float()
+                    _d43301_shadow_norm_ref = _x32.to(hidden_states.dtype)
+            except Exception as _e:
+                print(f"[D43301-SHADOW] norm-ref err: {_e}", flush=True)
+
         hidden_states = self.norm(ssm_output, gate)
+        _d43301_log_mixer(self.prefix, "post_norm", hidden_states)
+        if _d43301_shadow_norm_ref is not None:
+            _d43301_log_shadow(
+                self.prefix, "norm", hidden_states, _d43301_shadow_norm_ref
+            )
+
+        # [D43301-SHADOW] fp32 reference out_proj. Skip under TP>1 (see norm).
+        _d43301_shadow_out_ref = None
+        if (
+            int(_d43301_os.environ.get("VLLM_D43301_SHADOW", "1"))
+            and getattr(self.out_proj, "tp_size", 1) == 1
+            and _D43301_MIXER_SEEN < _D43301_MIXER_LIMIT
+        ):
+            try:
+                with torch.no_grad():
+                    _w = self.out_proj.weight.float()
+                    _y32 = torch.nn.functional.linear(hidden_states.float(), _w)
+                    _b = getattr(self.out_proj, "bias", None)
+                    if _b is not None:
+                        _y32 = _y32 + _b.float()
+                    _d43301_shadow_out_ref = _y32.to(hidden_states.dtype)
+            except Exception as _e:
+                print(f"[D43301-SHADOW] out_proj-ref err: {_e}", flush=True)
 
         # 5. Final linear projection
         output, _ = self.out_proj(hidden_states)
+        _d43301_log_mixer(self.prefix, "post_out_proj", output)
+        if _d43301_shadow_out_ref is not None:
+            _d43301_log_shadow(self.prefix, "out_proj", output, _d43301_shadow_out_ref)
 
         return output
 

@@ -401,6 +401,26 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         has_prior_state = seq_lens_cpu > 1
         prefill_to_decode = single_token_prefill_rows & has_prior_state
         if torch.any(prefill_to_decode).item():
+            # [D43301-RR] log the reroute event: which rows, what query/seq lens.
+            # This confirms the PR #42430 path is actually firing on D-side.
+            import os as _os
+
+            _rr_n = int(_os.environ.get("VLLM_D43301_RR_LOG_N", "5000"))
+            _rr_seen = getattr(self, "_d43301_rr_seen", 0)
+            if _rr_seen < _rr_n:
+                _ql = query_lens_cpu.tolist()
+                _sl = seq_lens_cpu.tolist()
+                _isp_pre = is_prefilling.tolist()
+                _p2d = prefill_to_decode.tolist()
+                _idxs = [i for i, v in enumerate(_p2d) if v]
+                print(
+                    f"[D43301-RR] event#{_rr_seen} layer_prefix={getattr(self, '_d43301_prefix', '?')} "
+                    f"num_reqs={len(_ql)} reroute_rows={_idxs} "
+                    f"query_lens={_ql} seq_lens={_sl} "
+                    f"is_prefilling_pre={_isp_pre}",
+                    flush=True,
+                )
+                self._d43301_rr_seen = _rr_seen + 1
             is_prefilling = is_prefilling.clone()
             is_prefilling[prefill_to_decode] = False
             common_attn_metadata = common_attn_metadata.replace(

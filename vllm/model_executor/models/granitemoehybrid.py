@@ -52,6 +52,33 @@ from .utils import (
 )
 
 
+import os as _d43301_os
+
+# [D43301] per-layer hidden-state probe. Bounded by env to avoid log flood.
+_D43301_LAYER_SEEN = 0
+_D43301_LAYER_LIMIT = int(_d43301_os.environ.get("VLLM_D43301_LAYER_N", "5000"))
+
+
+def _d43301_layer_log(layer_idx, layer_type, point, hs):
+    global _D43301_LAYER_SEEN
+    if _D43301_LAYER_SEEN >= _D43301_LAYER_LIMIT:
+        return
+    try:
+        f = hs.detach().float()
+        print(
+            f"[D43301-LAYER] seq={_D43301_LAYER_SEEN} layer={layer_idx} "
+            f"type={layer_type} point={point} "
+            f"shape={tuple(hs.shape)} dtype={hs.dtype} "
+            f"abs_sum={f.abs().sum().item():.6e} "
+            f"max_abs={f.abs().max().item():.6e} "
+            f"mean={f.mean().item():.6e}",
+            flush=True,
+        )
+        _D43301_LAYER_SEEN += 1
+    except Exception as _e:
+        print(f"[D43301-LAYER] err: {_e}", flush=True)
+
+
 class GraniteMoeHybridMambaDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -66,6 +93,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.residual_multiplier = config.residual_multiplier
+        self._d43301_layer_idx = layer_idx  # for [D43301-LAYER] log
 
         self.mamba = MambaMixer2(
             hidden_size=config.hidden_size,
@@ -115,13 +143,18 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         **kwargs,
     ):
+        _d43301_layer_log(self._d43301_layer_idx, "mamba", "in", hidden_states)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        _d43301_layer_log(self._d43301_layer_idx, "mamba", "post_ln1", hidden_states)
         output = self.mamba(hidden_states)
+        _d43301_layer_log(self._d43301_layer_idx, "mamba", "post_mamba", output)
         hidden_states = residual + output * self.residual_multiplier
+        _d43301_layer_log(self._d43301_layer_idx, "mamba", "post_res1", hidden_states)
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        _d43301_layer_log(self._d43301_layer_idx, "mamba", "post_ln2", hidden_states)
         if self.shared_mlp is None:
             if self.block_sparse_moe is not None:
                 hidden_states = self.block_sparse_moe(hidden_states)
@@ -135,7 +168,9 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
                 del moe_hidden_states
             else:
                 hidden_states = self.shared_mlp(hidden_states)
+        _d43301_layer_log(self._d43301_layer_idx, "mamba", "post_moe", hidden_states)
         hidden_states = residual + hidden_states * self.residual_multiplier
+        _d43301_layer_log(self._d43301_layer_idx, "mamba", "out", hidden_states)
 
         return hidden_states, residual
 
@@ -153,6 +188,7 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.residual_multiplier = config.residual_multiplier
+        self._d43301_layer_idx = layer_idx  # for [D43301-LAYER] log
 
         self.self_attn = GraniteMoeHybridAttention(
             config,
@@ -191,17 +227,22 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
+        _d43301_layer_log(self._d43301_layer_idx, "attn", "in", hidden_states)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        _d43301_layer_log(self._d43301_layer_idx, "attn", "post_ln1", hidden_states)
 
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        _d43301_layer_log(self._d43301_layer_idx, "attn", "post_attn", hidden_states)
         hidden_states = residual + hidden_states * self.residual_multiplier
+        _d43301_layer_log(self._d43301_layer_idx, "attn", "post_res1", hidden_states)
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        _d43301_layer_log(self._d43301_layer_idx, "attn", "post_ln2", hidden_states)
         if self.shared_mlp is None:
             if self.block_sparse_moe is not None:
                 hidden_states = self.block_sparse_moe(hidden_states)
@@ -215,7 +256,9 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
                 del moe_hidden_states
             else:
                 hidden_states = self.shared_mlp(hidden_states)
+        _d43301_layer_log(self._d43301_layer_idx, "attn", "post_moe", hidden_states)
         hidden_states = residual + hidden_states * self.residual_multiplier
+        _d43301_layer_log(self._d43301_layer_idx, "attn", "out", hidden_states)
 
         return hidden_states, residual
 
@@ -400,6 +443,7 @@ class GraniteMoeHybridModel(nn.Module):
             )
 
         hidden_states = self.norm(hidden_states)
+        _d43301_layer_log(-1, "model", "final_norm", hidden_states)
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
