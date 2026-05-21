@@ -67,22 +67,22 @@
         "is_multimodal_model": false,
         "dtype": "torch.bfloat16"
     },
-    "Zyphra/Zamba2-7B-instruct": {
+    "Zyphra/Zamba2-1.2B-instruct": {
         "architectures": [
             "Zamba2ForCausalLM"
         ],
         "model_type": "zamba2",
         "text_model_type": "zamba2",
-        "hidden_size": 3584,
-        "total_num_hidden_layers": 81,
+        "hidden_size": 2048,
+        "total_num_hidden_layers": 38,
         "total_num_attention_heads": 32,
-        "head_size": 224,
+        "head_size": 128,
         "vocab_size": 32000,
         "total_num_kv_heads": 32,
         "num_experts": 0,
         "is_deepseek_mla": false,
         "is_multimodal_model": false,
-        "dtype": "torch.bfloat16"
+        "dtype": "torch.float32"
     },
     "mosaicml/mpt-7b": {
         "architectures": [

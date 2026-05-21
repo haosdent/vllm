@@ -595,7 +595,13 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
             "(add_prefix_space / prepend_scheme mismatch).",
         },
     ),
-    "Zamba2ForCausalLM": _HfExamplesInfo("Zyphra/Zamba2-7B-instruct"),
+    # Use the 1.2B variant: tests/models/language/generation/test_hybrid.py
+    # also references it, so /fsx/hf_cache on CI already has its weights.
+    # That lets get_torch_dtype's safetensors-metadata fallback hit the local
+    # snapshot via snapshot_download(local_files_only=True) when HF Hub
+    # rate-limits the resolver endpoint -- Zamba2's config.json has no
+    # torch_dtype field, so we depend on the safetensors header for it.
+    "Zamba2ForCausalLM": _HfExamplesInfo("Zyphra/Zamba2-1.2B-instruct"),
     "MiMoForCausalLM": _HfExamplesInfo("XiaomiMiMo/MiMo-7B-RL", trust_remote_code=True),
     "MiMoV2FlashForCausalLM": _HfExamplesInfo(
         "XiaomiMiMo/MiMo-V2-Flash", trust_remote_code=True
