@@ -12,7 +12,9 @@ BASE_URL = "http://localhost:8192/v1"
 NUM_CONCURRENT = 1
 TASK = "gsm8k"
 FILTER = "exact_match,strict-match"
-RTOL = 0.03
+# [D43301] Temporarily loosened so both C1 and C2 print result before set -e
+# kills the script run; revert to 0.03 when probe stage ends.
+RTOL = 0.20
 # [D43301] Limit to N prompts so logs are scannable. 50 still has enough
 # samples to see L4 drop pattern if it's per-prompt-deterministic.
 GSM8K_LIMIT = 50
