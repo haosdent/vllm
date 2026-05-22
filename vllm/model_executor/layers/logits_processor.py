@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that compute logits from hidden_stats."""
 
+import os as _d43301_os
+
 import torch
 
 from vllm.distributed import (
@@ -92,8 +94,21 @@ class LogitsProcessor(PluggableLayer):
         lm_head: VocabParallelEmbedding,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
-        # Get the logits for the next tokens.
-        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        # [D43301] hypothesis: per-rank lm_head bf16 GEMM on L4 produces ULP-
+        # level different top-1/top-2 logits vs TP=1 path; sampler argmax then
+        # flips chosen token on close ties. Force fp32 GEMM per rank to test.
+        # Default ON. Result is left as fp32 (sampler casts to fp32 anyway).
+        if int(_d43301_os.environ.get("VLLM_D43301_FORCE_FP32_LMHEAD", "1")):
+            with torch.no_grad():
+                _w = lm_head.weight.float()
+                logits = torch.nn.functional.linear(hidden_states.float(), _w)
+                if embedding_bias is not None:
+                    logits = logits + embedding_bias.float()
+        else:
+            # Get the logits for the next tokens.
+            logits = lm_head.quant_method.apply(
+                lm_head, hidden_states, bias=embedding_bias
+            )
 
         # Gather logits for TP
         logits = self._gather_logits(logits)

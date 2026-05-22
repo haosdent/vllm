@@ -2,8 +2,43 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that samples the next tokens from the model's outputs."""
 
+import os as _d43301_os
+
 import torch
 import torch.nn as nn
+
+# [D43301] per-token sampler probe: log chosen + top1/top2 logit + gap so we
+# can diff C1 (TP=1) and C2 (TP=2) decode token streams and identify the first
+# divergence step and the gap size at that step (ULP-tie evidence).
+_D43301_SAMPLE_SEEN = 0
+_D43301_SAMPLE_LIMIT = int(_d43301_os.environ.get("VLLM_D43301_SAMPLE_N", "500"))
+
+
+def _d43301_sample_probe(logits):
+    global _D43301_SAMPLE_SEEN
+    if not int(_d43301_os.environ.get("VLLM_D43301_SAMPLE", "1")):
+        return
+    if _D43301_SAMPLE_SEEN >= _D43301_SAMPLE_LIMIT:
+        return
+    try:
+        with torch.no_grad():
+            top2_vals, top2_idx = logits.topk(2, dim=-1)
+        for b in range(logits.shape[0]):
+            top1_v = top2_vals[b, 0].item()
+            top2_v = top2_vals[b, 1].item()
+            top1_i = int(top2_idx[b, 0].item())
+            top2_i = int(top2_idx[b, 1].item())
+            gap = top1_v - top2_v
+            print(
+                f"[D43301-SAMPLE] step={_D43301_SAMPLE_SEEN} batch={b} "
+                f"top1=({top1_i},{top1_v:.6f}) top2=({top2_i},{top2_v:.6f}) "
+                f"gap={gap:.6e}",
+                flush=True,
+            )
+        _D43301_SAMPLE_SEEN += 1
+    except Exception as _e:
+        print(f"[D43301-SAMPLE] err: {_e}", flush=True)
+
 
 from vllm.config.model import LogprobsMode
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -89,6 +124,9 @@ class Sampler(nn.Module):
 
         # Use float32 for the logits.
         logits = logits.to(torch.float32)
+
+        # [D43301] log chosen + top1/top2 logit + gap pre-sample (post fp32).
+        _d43301_sample_probe(logits)
 
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
