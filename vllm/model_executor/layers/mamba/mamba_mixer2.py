@@ -614,22 +614,31 @@ class MambaMixer2(MambaBase, PluggableLayer):
         _d43301_init_once()
         _d43301_log_mixer(self.prefix, "in", hidden_states)
 
-        # [D43301] hypothesis test: force fp32 in_proj to bypass cuBLAS bf16
-        # GEMM hardware-specific heuristic.
-        # Default OFF: SHADOW evidence points at out_proj, not in_proj.
-        _d43301_force_fp32_in = int(_d43301_os.environ.get("VLLM_D43301_FORCE_FP32_IN", "0"))
-        if _d43301_force_fp32_in:
-            with torch.no_grad():
-                _w = self.in_proj.weight.float()
-                projected_states = torch.nn.functional.linear(hidden_states.float(), _w)
-                _b = getattr(self.in_proj, "bias", None)
-                if _b is not None:
-                    projected_states = projected_states + _b.float()
-                projected_states = projected_states.to(hidden_states.dtype)
-        else:
-            # 1. Gated MLP's linear projection
-            projected_states, _ = self.in_proj(hidden_states)
+        # 1. Gated MLP's linear projection
+        projected_states, _ = self.in_proj(hidden_states)
         _d43301_log_mixer(self.prefix, "post_in_proj", projected_states)
+
+        # [D43301-SHADOW] fp32 reference in_proj GEMM, layer-0 only, bounded.
+        # Direct evidence of whether in_proj bf16 cuBLAS GEMM diverges from
+        # ideal fp32 GEMM differently on L4 vs A30 (the hypothesis from the
+        # out_proj SHADOW analysis). in_proj is ColumnParallelLinear -- per
+        # rank holds its own output slice and runs no all-reduce, so a local
+        # fp32 reference is meaningful even under TP>1.
+        if (
+            int(_d43301_os.environ.get("VLLM_D43301_SHADOW", "1"))
+            and _D43301_MIXER_SEEN < _D43301_MIXER_LIMIT
+            and ".layers.0." in self.prefix
+        ):
+            try:
+                with torch.no_grad():
+                    _w = self.in_proj.weight.float()
+                    _y_ref = torch.nn.functional.linear(hidden_states.float(), _w)
+                    _b = getattr(self.in_proj, "bias", None)
+                    if _b is not None:
+                        _y_ref = _y_ref + _b.float()
+                _d43301_log_shadow(self.prefix, "in_proj", projected_states, _y_ref)
+            except Exception as _e:
+                print(f"[D43301-SHADOW] in_proj err: {_e}", flush=True)
         if mup_vector is not None:
             projected_states = projected_states * mup_vector
 
