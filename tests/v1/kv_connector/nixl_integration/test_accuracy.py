@@ -6,13 +6,20 @@ import lm_eval
 import openai
 
 BASE_URL = "http://localhost:8192/v1"
-NUM_CONCURRENT = 100
+# Sequential + greedy decoding so the measurement is reproducible across
+# runs: random sampling + concurrent batching introduce ~0.05 variance
+# on 50-prompt gsm8k, which can mask or amplify small numerical
+# differences depending on luck. With NUM_CONCURRENT=1 the server sees
+# a fixed M=1 batch every step, eliminating cuBLAS shape-dependent
+# kernel selection variance.
+NUM_CONCURRENT = 1
 TASK = "gsm8k"
 FILTER = "exact_match,strict-match"
-# TODO(#43186): Widened from 0.03 to absorb chunk_scan/SSU numeric jitter
-# on granite-4.0-h-tiny under NIXL PD; tighten when the kernel divergence
-# is fixed.
-RTOL = 0.05
+RTOL = 0.03
+# Larger sample averages out the 1-2 prompt-level argmax flips that
+# bf16 cuBLAS ULP-tie produces under different TP shapes; with 200
+# prompts the per-config variance drops to ~0.02 (within RTOL).
+GSM8K_LIMIT = 200
 
 # Model-specific expected values
 EXPECTED_VALUES = {
@@ -22,7 +29,7 @@ EXPECTED_VALUES = {
     "deepseek-ai/DeepSeek-V2-Lite-Chat": 0.65,
     "google/gemma-3-4b-it": 0.74,
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8": 0.84,
-    "ibm-granite/granite-4.0-h-tiny": 0.77,
+    "ibm-granite/granite-4.0-h-tiny": 0.80,
     "Qwen/Qwen3.5-0.8B": 0.33,
 }
 
@@ -59,6 +66,11 @@ def test_accuracy():
         model="local-completions",
         model_args=model_args,
         tasks=TASK,
+        limit=GSM8K_LIMIT,
+        # Force greedy so chosen-token is argmax of logits; under random
+        # sampling, gsm8k has ~0.05 variance from temperature noise that
+        # masks measurement of small numerical differences across runs.
+        gen_kwargs="temperature=0,do_sample=False,top_k=1",
     )
 
     measured_value = results["results"][TASK][FILTER]
