@@ -76,6 +76,13 @@ def test_accuracy():
     measured_value = results["results"][TASK][FILTER]
     expected_value = EXPECTED_VALUES.get(MODEL_NAME)
 
+    # Always print so CI logs carry the number even when the assertion
+    # passes; needed to track measured values per config across runs.
+    print(
+        f"[ACCURACY] model={MODEL_NAME} "
+        f"expected={expected_value} measured={measured_value}"
+    )
+
     if expected_value is None:
         print(
             f"Warning: No expected value found for {MODEL_NAME}. "
