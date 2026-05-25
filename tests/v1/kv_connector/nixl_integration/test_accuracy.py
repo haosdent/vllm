@@ -6,13 +6,20 @@ import lm_eval
 import openai
 
 BASE_URL = "http://localhost:8192/v1"
-NUM_CONCURRENT = 100
+# Sequential decode so the server sees a constant M=1 batch every step;
+# random batch composition under NUM_CONCURRENT>1 makes cuBLAS pick
+# different bf16 GEMM kernels per request, which shifts the
+# per-prompt ULP-tie outcomes at lm_head and adds ~0.04 of variance
+# on 200-prompt gsm8k (verified by buildkite #67997 hitting 0.745 on
+# granite TP=1 with NUM_CONCURRENT=100 vs 0.79 with NUM_CONCURRENT=1).
+NUM_CONCURRENT = 1
 TASK = "gsm8k"
 FILTER = "exact_match,strict-match"
-# TODO(#43186): Widened from 0.03 to absorb chunk_scan/SSU numeric jitter
-# on granite-4.0-h-tiny under NIXL PD; tighten when the kernel divergence
-# is fixed.
-RTOL = 0.05
+RTOL = 0.03
+# Larger sample averages out the 1-2 prompt-level argmax flips that
+# bf16 cuBLAS ULP-tie produces under different TP shapes; with 200
+# prompts the per-config variance drops to ~0.02 (within RTOL).
+GSM8K_LIMIT = 200
 
 # Model-specific expected values
 EXPECTED_VALUES = {
@@ -22,8 +29,8 @@ EXPECTED_VALUES = {
     "deepseek-ai/DeepSeek-V2-Lite-Chat": 0.65,
     "google/gemma-3-4b-it": 0.74,
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8": 0.84,
-    "ibm-granite/granite-4.0-h-tiny": 0.77,
-    "Qwen/Qwen3.5-0.8B": 0.33,
+    "ibm-granite/granite-4.0-h-tiny": 0.80,
+    "Qwen/Qwen3.5-0.8B": 0.36,
 }
 
 SIMPLE_PROMPT = (
@@ -59,17 +66,26 @@ def test_accuracy():
         model="local-completions",
         model_args=model_args,
         tasks=TASK,
+        limit=GSM8K_LIMIT,
+        # Force greedy so chosen-token is argmax of logits; under random
+        # sampling, gsm8k has ~0.05 variance from temperature noise that
+        # masks measurement of small numerical differences across runs.
+        gen_kwargs="temperature=0,do_sample=False,top_k=1",
     )
 
     measured_value = results["results"][TASK][FILTER]
     expected_value = EXPECTED_VALUES.get(MODEL_NAME)
+
+    # Always print so the per-config measure is in CI logs even when
+    # the assertion passes; lets us trend-track drift instead of only
+    # seeing a number when something breaks.
+    print(f"Measured value: {measured_value} (expected {expected_value})")
 
     if expected_value is None:
         print(
             f"Warning: No expected value found for {MODEL_NAME}. "
             "Skipping accuracy check."
         )
-        print(f"Measured value: {measured_value}")
         return
 
     assert (
