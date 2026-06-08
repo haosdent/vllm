@@ -8,6 +8,8 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -54,6 +56,88 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+logger = init_logger(__name__)
+
+_MARLIN_MOE_BLOCK_SIZE_M_CHOICES = (8, 16, 32, 48, 64)
+
+
+def _get_marlin_moe_block_size_override() -> int | None:
+    block_size_m = envs.VLLM_MARLIN_MOE_BLOCK_SIZE_M
+    if block_size_m == 0:
+        return None
+    if block_size_m not in _MARLIN_MOE_BLOCK_SIZE_M_CHOICES:
+        raise ValueError(
+            "VLLM_MARLIN_MOE_BLOCK_SIZE_M must be one of "
+            f"{_MARLIN_MOE_BLOCK_SIZE_M_CHOICES} or 0, got {block_size_m}."
+        )
+    return block_size_m
+
+
+def _apply_marlin_moe_input_dtype_minimum(
+    block_size_m: int, input_dtype: torch.dtype | None
+) -> int:
+    if input_dtype is not None and input_dtype.itemsize == 1:
+        block_size_m = max(block_size_m, 16)
+    return block_size_m
+
+
+def _select_marlin_moe_block_size(
+    M: int,
+    topk: int,
+    E: int,
+    input_dtype: torch.dtype | None = None,
+) -> int:
+    override = _get_marlin_moe_block_size_override()
+    if override is not None:
+        return _apply_marlin_moe_input_dtype_minimum(override, input_dtype)
+
+    # M block size selection logic
+    # TODO: tune this further for specific models
+    for block_size_m in _MARLIN_MOE_BLOCK_SIZE_M_CHOICES:
+        if M * topk / E / block_size_m < 0.9:
+            break
+    return _apply_marlin_moe_input_dtype_minimum(block_size_m, input_dtype)
+
+
+def _select_batched_marlin_moe_block_size(
+    batch_tokens_max: int,
+    input_dtype: torch.dtype | None = None,
+) -> int:
+    override = _get_marlin_moe_block_size_override()
+    if override is not None:
+        return _apply_marlin_moe_input_dtype_minimum(override, input_dtype)
+
+    block_size_m = 64
+    for b_m in _MARLIN_MOE_BLOCK_SIZE_M_CHOICES:
+        if batch_tokens_max / b_m < 0.9:
+            block_size_m = b_m
+            break
+    return _apply_marlin_moe_input_dtype_minimum(block_size_m, input_dtype)
+
+
+def _log_marlin_moe_block_size(
+    block_size_m: int,
+    *,
+    M: int,
+    topk: int,
+    E: int,
+    input_dtype: torch.dtype | None,
+    batched: bool,
+) -> None:
+    if not envs.VLLM_MARLIN_MOE_LOG_BLOCK_SIZE:
+        return
+    logger.info_once(
+        "Marlin MoE selected block_size_m=%s, override=%s, M=%s, "
+        "topk=%s, E=%s, input_dtype=%s, batched=%s",
+        block_size_m,
+        envs.VLLM_MARLIN_MOE_BLOCK_SIZE_M,
+        M,
+        topk,
+        E,
+        input_dtype,
+        batched,
+    )
 
 
 def _fused_marlin_moe(
@@ -317,14 +401,15 @@ def fused_marlin_moe(
     assert num_bits in [4, 8]
     assert topk_weights.dtype == torch.float32
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
-
-    if input_dtype is not None and input_dtype.itemsize == 1:
-        block_size_m = max(block_size_m, 16)
+    block_size_m = _select_marlin_moe_block_size(M, topk, E, input_dtype)
+    _log_marlin_moe_block_size(
+        block_size_m,
+        M=M,
+        topk=topk,
+        E=E,
+        input_dtype=input_dtype,
+        batched=False,
+    )
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -485,16 +570,15 @@ def batched_fused_marlin_moe(
     # [B * MAX_TOKENS, K] and top_k can be interpreted as just 1.
     topk = 1
 
-    # TODO(varun) : Choose a decent block size like in fused_marlin_moe
-    # Tune block_size_m based on expert capacity to reduce padding overhead.
-    block_size_m = 64
-    for b_m in [8, 16, 32, 48, 64]:
-        if BATCH_TOKENS_MAX / b_m < 0.9:
-            block_size_m = b_m
-            break
-
-    if input_dtype is not None and input_dtype.itemsize == 1:
-        block_size_m = max(block_size_m, 16)
+    block_size_m = _select_batched_marlin_moe_block_size(BATCH_TOKENS_MAX, input_dtype)
+    _log_marlin_moe_block_size(
+        block_size_m,
+        M=M,
+        topk=topk,
+        E=E,
+        input_dtype=input_dtype,
+        batched=True,
+    )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = batched_moe_align_block_size(
         max_tokens_per_batch=BATCH_TOKENS_MAX,

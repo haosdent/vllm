@@ -163,6 +163,8 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+    VLLM_MARLIN_MOE_BLOCK_SIZE_M: int = 0
+    VLLM_MARLIN_MOE_LOG_BLOCK_SIZE: bool = False
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
@@ -1376,6 +1378,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+    ),
+    # Force Marlin MoE's token block size for tuning. 0 keeps the heuristic.
+    "VLLM_MARLIN_MOE_BLOCK_SIZE_M": lambda: int(
+        os.environ.get("VLLM_MARLIN_MOE_BLOCK_SIZE_M", "0")
+    ),
+    # Log the selected Marlin MoE token block size once per worker.
+    "VLLM_MARLIN_MOE_LOG_BLOCK_SIZE": lambda: (
+        os.environ.get("VLLM_MARLIN_MOE_LOG_BLOCK_SIZE", "0") == "1"
     ),
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
