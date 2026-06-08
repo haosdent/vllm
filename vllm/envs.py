@@ -144,6 +144,8 @@ if TYPE_CHECKING:
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
+    VLLM_FLASHMLA_SPARSE_FA3_DECODE: bool = False
+    VLLM_FLASHMLA_SPARSE_FA3_PREFILL: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1283,7 +1285,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
-    # If set, vLLM will pick up the provided Flash Attention MLA
+    # If set, FlashMLA sparse with BF16 KV uses FA3 for decode tokens while
+    # keeping FlashMLA sparse for prefill tokens. This is an experimental
+    # DeepSeek/GLM sparse MLA path for Hopper.
+    "VLLM_FLASHMLA_SPARSE_FA3_DECODE": lambda: bool(
+        int(os.getenv("VLLM_FLASHMLA_SPARSE_FA3_DECODE", "0"))
+    ),
+    # If set, FlashMLA sparse with BF16 KV uses tokenwise FA3 for prefill
+    # tokens. This avoids FlashMLA sparse prefill head padding on Hopper.
+    "VLLM_FLASHMLA_SPARSE_FA3_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_FLASHMLA_SPARSE_FA3_PREFILL", "0"))
+    ),
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
     # so that users can colocate other actors on the same GPUs as vLLM.

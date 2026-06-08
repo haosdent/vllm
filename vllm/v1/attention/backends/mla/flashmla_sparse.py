@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
@@ -27,6 +28,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
     SparseMLAAttentionImpl,
 )
+from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
@@ -158,6 +160,10 @@ class FlashMLASparseMetadata(AttentionMetadata):
     req_id_per_token: torch.Tensor
     block_size: int = 64
     topk_tokens: int = 2048
+    num_decodes: int = 0
+    num_decode_tokens: int = 0
+    num_prefills: int = 0
+    num_prefill_tokens: int = 0
 
     @dataclass
     class FP8KernelMetadata:
@@ -512,6 +518,12 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             | FlashMLASparseMetadata.FP8KernelMetadata
             | None
         ) = None
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                cm,
+                decode_threshold=self.reorder_batch_threshold or 1,
+            )
+        )
         fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
         if self.use_fp8_kv_cache:
             if fp8_use_mixed_batch:
@@ -530,6 +542,10 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
             fp8_extra_metadata=fp8_extra_metadata,
             fp8_use_mixed_batch=fp8_use_mixed_batch,
         )
@@ -567,6 +583,8 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
+        self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]
+        self.logits_soft_cap = logits_soft_cap
         self.softmax_scale = scale
         assert indexer is not None
         self.topk_indices_buffer: torch.Tensor | None = indexer.topk_indices_buffer
@@ -603,6 +621,38 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 (q_concat_shape, torch.bfloat16),
             )
 
+        capability = current_platform.get_device_capability()
+        fa3_requested_decode = envs.VLLM_FLASHMLA_SPARSE_FA3_DECODE
+        fa3_requested_prefill = envs.VLLM_FLASHMLA_SPARSE_FA3_PREFILL
+        bf16_fa3_supported = (
+            not is_quantized_kv_cache(kv_cache_dtype)
+            and capability is not None
+            and capability.major == 9
+        )
+        self.use_bf16_fa3_decode = fa3_requested_decode and bf16_fa3_supported
+        self.use_bf16_fa3_prefill = fa3_requested_prefill and bf16_fa3_supported
+        if (fa3_requested_decode or fa3_requested_prefill) and not bf16_fa3_supported:
+            logger.warning_once(
+                "FlashMLA sparse FA3 BF16 path is enabled but this "
+                "FlashMLA sparse layer is not using the BF16 Hopper path."
+            )
+        if self.use_bf16_fa3_decode or self.use_bf16_fa3_prefill:
+            self.fa3_query_start_loc = torch.arange(
+                max_tokens + 1,
+                dtype=torch.int32,
+                device=self.q_concat_buffer.device,
+            )
+            logger.info_once(
+                "Using experimental FA3 tokenwise path for FlashMLA sparse "
+                "BF16 KV (decode=%s, prefill=%s, heads=%d, prefill_padding=%d).",
+                self.use_bf16_fa3_decode,
+                self.use_bf16_fa3_prefill,
+                self.num_heads,
+                self.prefill_padding,
+            )
+        else:
+            self.fa3_query_start_loc = None
+
     def _forward_bf16_kv(
         self,
         q: torch.Tensor,
@@ -610,6 +660,18 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         topk_indices: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
     ) -> torch.Tensor:
+        use_fa3_decode = self._can_use_bf16_fa3_decode(attn_metadata)
+        use_fa3_prefill = self._can_use_bf16_fa3_prefill(attn_metadata)
+        if use_fa3_decode or use_fa3_prefill:
+            return self._forward_bf16_kv_fa3_decode_prefill(
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata,
+                use_fa3_decode=use_fa3_decode,
+                use_fa3_prefill=use_fa3_prefill,
+            )
+
         # Convert per-request indices to global slots (decode) or workspace
         # offsets (prefill).
         topk_indices = triton_convert_req_index_to_global_index(
@@ -624,6 +686,157 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             q,
             kv_c_and_k_pe_cache,
             topk_indices,
+        )
+
+    def _can_use_bf16_fa3_decode(
+        self,
+        attn_metadata: FlashMLASparseMetadata,
+    ) -> bool:
+        # The SGLang path this mirrors treats every decode query as a separate
+        # FA3 sequence with q_len=1. Speculative multi-token decode can be added
+        # later, but the target deployment disables speculative MTP.
+        return (
+            self.use_bf16_fa3_decode
+            and attn_metadata.num_decode_tokens > 0
+            and attn_metadata.num_decode_tokens == attn_metadata.num_decodes
+            and self.dcp_world_size in (-1, 1)
+        )
+
+    def _can_use_bf16_fa3_prefill(
+        self,
+        attn_metadata: FlashMLASparseMetadata,
+    ) -> bool:
+        # Treat each sparse prefill query token as q_len=1. The top-k indexer
+        # already materializes per-token sparse KV rows, so this computes the
+        # same selected-token attention without padding the head dimension to
+        # FlashMLA sparse prefill's Hopper/Blackwell constraints.
+        return (
+            self.use_bf16_fa3_prefill
+            and attn_metadata.num_prefill_tokens > 0
+            and self.dcp_world_size in (-1, 1)
+        )
+
+    def _forward_bf16_kv_fa3_decode_prefill(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        use_fa3_decode: bool,
+        use_fa3_prefill: bool,
+    ) -> torch.Tensor:
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_prefill_tokens = attn_metadata.num_prefill_tokens
+
+        if num_prefill_tokens == 0:
+            return self._bf16_fa3_tokenwise_kernel(
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata.req_id_per_token[:num_decode_tokens],
+                attn_metadata,
+            )
+
+        attn_out = q.new_empty(
+            (attn_metadata.num_actual_tokens, self.num_heads, self.kv_lora_rank)
+        )
+        if num_decode_tokens > 0:
+            if use_fa3_decode:
+                attn_out[:num_decode_tokens] = self._bf16_fa3_tokenwise_kernel(
+                    q[:num_decode_tokens],
+                    kv_c_and_k_pe_cache,
+                    topk_indices[:num_decode_tokens],
+                    attn_metadata.req_id_per_token[:num_decode_tokens],
+                    attn_metadata,
+                )
+            else:
+                decode_topk_indices = triton_convert_req_index_to_global_index(
+                    attn_metadata.req_id_per_token[:num_decode_tokens],
+                    attn_metadata.block_table,
+                    topk_indices[:num_decode_tokens],
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    NUM_TOPK_TOKENS=topk_indices.shape[1],
+                )
+                attn_out[:num_decode_tokens] = self._bf16_flash_mla_kernel(
+                    q[:num_decode_tokens],
+                    kv_c_and_k_pe_cache,
+                    decode_topk_indices,
+                )
+
+        if use_fa3_prefill:
+            attn_out[num_decode_tokens:] = self._bf16_fa3_tokenwise_kernel(
+                q[num_decode_tokens:],
+                kv_c_and_k_pe_cache,
+                topk_indices[num_decode_tokens:],
+                attn_metadata.req_id_per_token[num_decode_tokens:],
+                attn_metadata,
+            )
+            logger.info_once(
+                "FlashMLA sparse BF16 prefill uses tokenwise FA3 "
+                "and avoids FlashMLA head padding."
+            )
+            return attn_out
+
+        prefill_topk_indices = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token[num_decode_tokens:],
+            attn_metadata.block_table,
+            topk_indices[num_decode_tokens:],
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+        )
+        attn_out[num_decode_tokens:] = self._bf16_flash_mla_kernel(
+            q[num_decode_tokens:],
+            kv_c_and_k_pe_cache,
+            prefill_topk_indices,
+        )
+        return attn_out
+
+    def _bf16_fa3_tokenwise_kernel(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        req_id_per_token: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+    ) -> torch.Tensor:
+        num_tokens = q.shape[0]
+        q_nope, q_pe = torch.split(
+            q, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        topk_indices, topk_lens = triton_convert_req_index_to_global_index(
+            req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
+        )
+
+        flat_kv_cache = kv_c_and_k_pe_cache.view(-1, kv_c_and_k_pe_cache.shape[-1])
+        kv_c_cache = flat_kv_cache[:, : self.kv_lora_rank].view(
+            -1, 1, 1, self.kv_lora_rank
+        )
+        k_pe_cache = flat_kv_cache[:, self.kv_lora_rank :].view(
+            -1, 1, 1, self.qk_rope_head_dim
+        )
+
+        assert self.fa3_query_start_loc is not None
+        query_start_loc = self.fa3_query_start_loc[: num_tokens + 1]
+        return flash_attn_varlen_func(
+            q=q_pe,
+            k=k_pe_cache,
+            v=kv_c_cache,
+            q_v=q_nope,
+            max_seqlen_q=1,
+            cu_seqlens_q=query_start_loc,
+            max_seqlen_k=topk_indices.shape[1],
+            seqused_k=topk_lens,
+            block_table=topk_indices,
+            softmax_scale=self.scale,
+            causal=True,
+            softcap=self.logits_soft_cap or 0.0,
+            return_softmax_lse=False,
+            fa_version=3,
         )
 
     def _forward_fp8_kv_separate_prefill_decode(
