@@ -278,9 +278,9 @@ __global__ void Marlin(
     int prob_k,             // reduction dimension k
     int* locks,             // extra global storage for barrier synchronization
     bool has_bias,
-    bool use_atomic_add,  // whether to use atomic add to reduce
-    bool use_fp32_reduce  // whether to use fp32 global reduce
-) {
+    bool use_atomic_add,   // whether to use atomic add to reduce
+    bool use_fp32_reduce,  // whether to use fp32 global reduce
+    int max_shared_mem) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -890,7 +890,14 @@ __global__ void Marlin(
   constexpr int sh_s_size = has_act_order ? (act_s_max_num_groups * s_sh_stride)
                                           : (stages * s_sh_stage);
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
+  constexpr int sh_block_meta_size =
+      (is_a_8bit ? (4 * thread_m_blocks) : 0) + moe_block_size;
+  constexpr int shm_size_used = sh_block_meta_size +
+                                stages * (g_idx_stage + zp_sh_stage) +
+                                sh_s_size + sh_b_red_bias_size;
   int4* sh_a = sh_s + sh_s_size;
+  int sh_a_max_row =
+      ((max_shared_mem - 1024) / 16 - shm_size_used) / (thread_k_blocks * 2);
 
   // Register storage for double buffer of shared memory reads.
   FragA frag_a[2][thread_m_blocks];
@@ -967,19 +974,26 @@ __global__ void Marlin(
   };
   // Asynchronously fetch the next A, B and s tile from global to the next
   // shared memory pipeline location.
-  auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
+  bool should_load_a = true;
+  int max_num_stage_groups =
+      ((sh_a_max_row - moe_block_size) / moe_block_size + 1) / stages;
+  max_num_stage_groups = max(max_num_stage_groups, 1);
+  auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true,
+                             int pipe_a = 0) {
     if (pred) {
-      int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe;
+      if (should_load_a) {
+        int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe_a;
   #pragma unroll
-      for (int i = 0; i < a_sh_wr_iters; i++) {
-        int row = a_gl_rd_delta_i / a_gl_stride * i + a_gl_rd_row;
-        int64_t sorted_row = 0;
-        if (!m_block_size_8 || row < 8)
-          sorted_row = sh_rd_block_sorted_ids[row];
-        int64_t true_idx =
-            sorted_row * a_gl_stride + a_gl_rd_col + a_gl_rd_delta_o * a_off;
-        cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx],
-                       row < block_num_valid_tokens);
+        for (int i = 0; i < a_sh_wr_iters; i++) {
+          int row = a_gl_rd_delta_i / a_gl_stride * i + a_gl_rd_row;
+          int64_t sorted_row = 0;
+          if (!m_block_size_8 || row < 8)
+            sorted_row = sh_rd_block_sorted_ids[row];
+          int64_t true_idx =
+              sorted_row * a_gl_stride + a_gl_rd_col + a_gl_rd_delta_o * a_off;
+          cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx],
+                         row < block_num_valid_tokens);
+        }
       }
 
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
@@ -1065,8 +1079,8 @@ __global__ void Marlin(
 
   // Load the next sub-tile from the current location in the shared memory pipe
   // into the current register buffer.
-  auto fetch_to_registers = [&](int k, int pipe) {
-    int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe;
+  auto fetch_to_registers = [&](int k, int pipe, int pipe_a = 0) {
+    int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe_a;
   #pragma unroll
     for (int i = 0; i < thread_m_blocks; i++)
       ldsm<m_block_size_8 ? 2 : 4, a_type_id>(
@@ -1928,7 +1942,7 @@ __global__ void Marlin(
           }
         }
       }
-      fetch_to_shared(i, i, i < slice_iters);
+      fetch_to_shared(i, i, i < slice_iters, i);
     }
 
     zero_accums();
@@ -1953,52 +1967,65 @@ __global__ void Marlin(
     // have even length meaning that the next iteration will always start at
     // index 0.
 
+    for (int stage_group_id = 0; stage_group_id < max_num_stage_groups;
+         stage_group_id++) {
   #pragma unroll
-    for (int pipe = 0; pipe < stages;) {
+      for (int pipe = 0; pipe < stages;) {
   #pragma unroll
-      for (int k = 0; k < b_sh_wr_iters; k++) {
-        fetch_to_registers(k + 1, pipe % stages);
-        fetch_scales_to_registers(k + 1, pipe);
-        fetch_zp_to_registers(k + 1, pipe);
-        if (k == b_sh_wr_iters - 2) {
-          fetch_to_shared((pipe + stages - 1) % stages, pipe,
-                          slice_iters >= stages);
-          pipe++;
-          wait_for_stage();
-          init_same_group(pipe % stages);
-        }
+        for (int k = 0; k < b_sh_wr_iters; k++) {
+          int idx =
+              (pipe >= stages && stage_group_id == max_num_stage_groups - 1)
+                  ? (pipe - stages)
+                  : (pipe + stage_group_id * stages);
+          fetch_to_registers(k + 1, pipe % stages, idx);
+          fetch_scales_to_registers(k + 1, pipe);
+          fetch_zp_to_registers(k + 1, pipe);
+          if (k == b_sh_wr_iters - 2) {
+            int idx = (pipe >= 1 && stage_group_id == max_num_stage_groups - 1)
+                          ? (pipe - 1)
+                          : (pipe + (stage_group_id + 1) * stages - 1);
+            fetch_to_shared((pipe + stages - 1) % stages, pipe,
+                            slice_iters >= stages, idx);
+            pipe++;
+            wait_for_stage();
+            init_same_group(pipe % stages);
+          }
 
-        if constexpr (!is_a_8bit) {
-          matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
-        } else {
-          static_assert(group_blocks != 0 && group_blocks != 1);
-          matmul_a8(k);
+          if constexpr (!is_a_8bit) {
+            matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
+          } else {
+            static_assert(group_blocks != 0 && group_blocks != 1);
+            matmul_a8(k);
+          }
+        }
+        slice_iters--;
+        if (slice_iters == 0) {
+          break;
         }
       }
-      slice_iters--;
+
+      a_gl_rd_col += a_gl_rd_delta_o * stages;
+
+      if constexpr (has_act_order) {
+        slice_k_start += tb_k * stages;
+
+        if (slice_k_start < prob_k) {
+          slice_k_start_shared_fetch += tb_k * stages;
+          int first_group_id = g_idx[slice_k_start];
+          int last_g_idx = slice_k_start + stages * tb_k * 2;
+          if (last_g_idx >= prob_k) {
+            last_g_idx = prob_k - 1;
+          }
+          int last_group_id = g_idx[last_g_idx];
+          if (last_group_id >= sh_first_group_id + sh_num_groups) {
+            fetch_act_order_scales_to_shared(false, first_group_id,
+                                             last_group_id);
+            __syncthreads();
+          }
+        }
+      }
       if (slice_iters == 0) {
         break;
-      }
-    }
-
-    a_gl_rd_col += a_gl_rd_delta_o * stages;
-
-    if constexpr (has_act_order) {
-      slice_k_start += tb_k * stages;
-
-      if (slice_k_start < prob_k) {
-        slice_k_start_shared_fetch += tb_k * stages;
-        int first_group_id = g_idx[slice_k_start];
-        int last_g_idx = slice_k_start + stages * tb_k * 2;
-        if (last_g_idx >= prob_k) {
-          last_g_idx = prob_k - 1;
-        }
-        int last_group_id = g_idx[last_g_idx];
-        if (last_group_id >= sh_first_group_id + sh_num_groups) {
-          fetch_act_order_scales_to_shared(false, first_group_id,
-                                           last_group_id);
-          __syncthreads();
-        }
       }
     }
 
@@ -2184,6 +2211,8 @@ __global__ void Marlin(
       if (last || use_atomic_add)
         // only the last block in a slice actually writes the result
         write_result(last);
+      int old_slice_row = slice_row;
+      int old_block_id = block_id;
       slice_row = 0;
       if (!in_part2) {
         slice_col_par += gridDim.x;
@@ -2193,6 +2222,9 @@ __global__ void Marlin(
       }
       is_first_matmul_in_slice = true;
       init_slice();
+      should_load_a =
+          old_block_id != block_id || old_slice_row ||
+          prob_k > thread_k_blocks * 16 * stages * max_num_stage_groups;
 
       if (slice_iters) {
         a_gl_rd_col =
