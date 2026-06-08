@@ -46,3 +46,11 @@ def test_marlin_moe_block_size_invalid_env(monkeypatch):
 
     with pytest.raises(ValueError, match="VLLM_MARLIN_MOE_BLOCK_SIZE_M"):
         marlin_moe._select_marlin_moe_block_size(M=1, topk=1, E=64)
+
+
+def test_marlin_moe_atomic_add_env_override(monkeypatch):
+    monkeypatch.delenv("VLLM_MARLIN_MOE_USE_ATOMIC_ADD", raising=False)
+    assert marlin_moe._should_use_marlin_moe_atomic_add() is False
+
+    monkeypatch.setenv("VLLM_MARLIN_MOE_USE_ATOMIC_ADD", "1")
+    assert marlin_moe._should_use_marlin_moe_atomic_add() is True

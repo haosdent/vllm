@@ -165,6 +165,7 @@ if TYPE_CHECKING:
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
     VLLM_MARLIN_MOE_BLOCK_SIZE_M: int = 0
     VLLM_MARLIN_MOE_LOG_BLOCK_SIZE: bool = False
+    VLLM_MARLIN_MOE_USE_ATOMIC_ADD: bool = False
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
@@ -1386,6 +1387,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log the selected Marlin MoE token block size once per worker.
     "VLLM_MARLIN_MOE_LOG_BLOCK_SIZE": lambda: (
         os.environ.get("VLLM_MARLIN_MOE_LOG_BLOCK_SIZE", "0") == "1"
+    ),
+    # Use Marlin MoE atomic-add reduce. Experimental H20/SGLang parity knob.
+    "VLLM_MARLIN_MOE_USE_ATOMIC_ADD": lambda: (
+        os.environ.get("VLLM_MARLIN_MOE_USE_ATOMIC_ADD", "0") == "1"
     ),
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(

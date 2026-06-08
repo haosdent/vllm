@@ -140,6 +140,10 @@ def _log_marlin_moe_block_size(
     )
 
 
+def _should_use_marlin_moe_atomic_add() -> bool:
+    return envs.VLLM_MARLIN_MOE_USE_ATOMIC_ADD
+
+
 def _fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -217,6 +221,7 @@ def _fused_marlin_moe(
     elif input_dtype == torch.float8_e4m3fn:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
 
+    use_atomic_add = _should_use_marlin_moe_atomic_add()
     intermediate_cache1 = ops.moe_wna16_marlin_gemm(
         gate_up_input,
         intermediate_cache1,
@@ -241,7 +246,7 @@ def _fused_marlin_moe(
         size_n=w13_num_shards * N,
         size_k=K,
         is_k_full=is_k_full,
-        use_atomic_add=False,
+        use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
     )
@@ -300,7 +305,7 @@ def _fused_marlin_moe(
         size_n=K,
         size_k=N,
         is_k_full=is_k_full,
-        use_atomic_add=False,
+        use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
     )
