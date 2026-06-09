@@ -22,6 +22,12 @@ except ImportError:
         )
 
 
+try:
+    from vllm.vllm_flash_attn import flash_attn_with_kvcache
+except ImportError:
+    flash_attn_with_kvcache = None
+
+
 NUM_HEADS = [(4, 4), (8, 2)]
 HEAD_SIZES = [40, 72, 80, 128, 256]
 BLOCK_SIZES = [16]
@@ -215,3 +221,65 @@ def test_varlen_with_paged_kv(
         torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
         f"{torch.max(torch.abs(output - ref_output))}",
     )
+
+
+@torch.inference_mode()
+def test_fa3_kvcache_matches_varlen_page_table() -> None:
+    torch.set_default_device("cuda")
+    if not is_fa_version_supported(3):
+        pytest.skip(
+            f'Flash attention version 3 not supported due to: "'
+            f'{fa_version_unsupported_reason(3)}"'
+        )
+    assert flash_attn_with_kvcache is not None
+
+    set_random_seed(0)
+    num_seqs = 4
+    num_query_heads = 16
+    num_kv_heads = 1
+    head_size = 64
+    value_head_size = 512
+    topk = 128
+    num_blocks = num_seqs * topk
+    scale = head_size**-0.5
+
+    q = torch.randn(num_seqs, num_query_heads, head_size, dtype=torch.bfloat16)
+    qv = torch.randn(num_seqs, num_query_heads, value_head_size, dtype=torch.bfloat16)
+    key_cache = torch.randn(
+        num_blocks, 1, num_kv_heads, head_size, dtype=torch.bfloat16
+    )
+    value_cache = torch.randn(
+        num_blocks, 1, num_kv_heads, value_head_size, dtype=torch.bfloat16
+    )
+    block_tables = torch.arange(num_blocks, dtype=torch.int32).view(num_seqs, topk)
+    kv_lens = torch.full((num_seqs,), topk, dtype=torch.int32)
+    cu_query_lens = torch.arange(num_seqs + 1, dtype=torch.int32)
+
+    varlen_output = flash_attn_varlen_func(
+        q=q,
+        k=key_cache,
+        v=value_cache,
+        q_v=qv,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=1,
+        max_seqlen_k=topk,
+        softmax_scale=scale,
+        causal=True,
+        block_table=block_tables,
+        fa_version=3,
+    )
+    kvcache_output = flash_attn_with_kvcache(
+        q=q,
+        k_cache=key_cache,
+        v_cache=value_cache,
+        qv=qv,
+        cache_seqlens=kv_lens,
+        page_table=block_tables,
+        cu_seqlens_q=cu_query_lens,
+        max_seqlen_q=1,
+        softmax_scale=scale,
+        causal=True,
+    )
+
+    torch.testing.assert_close(kvcache_output, varlen_output, atol=0, rtol=0)

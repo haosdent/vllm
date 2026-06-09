@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from typing import Any
 
 import vllm.envs as envs
@@ -14,6 +15,7 @@ logger = init_logger(__name__)
 # This module-level flag avoids repeated import attempts and ensures
 # consistent behavior (similar to IS_AITER_FOUND in _aiter_ops.py).
 _ROCM_FLASH_ATTN_AVAILABLE = False
+flash_attn_with_kvcache: Callable[..., Any]
 
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
@@ -21,6 +23,11 @@ if current_platform.is_cuda():
         flash_attn_varlen_func,
         get_scheduler_metadata,
     )
+    from vllm.vllm_flash_attn import (
+        flash_attn_with_kvcache as _flash_attn_with_kvcache,
+    )
+
+    flash_attn_with_kvcache = _flash_attn_with_kvcache
 
 elif current_platform.is_xpu():
     from vllm import _custom_ops as ops
@@ -29,6 +36,12 @@ elif current_platform.is_xpu():
     reshape_and_cache_flash = ops.reshape_and_cache_flash
     flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func  # type: ignore[assignment]
     get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]
+
+    def _flash_attn_with_kvcache_unsupported(*args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("flash_attn_with_kvcache is not supported on XPU")
+
+    flash_attn_with_kvcache = _flash_attn_with_kvcache_unsupported
+
 elif current_platform.is_rocm():
     try:
         from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
@@ -46,6 +59,11 @@ elif current_platform.is_rocm():
     # ROCm doesn't use scheduler metadata (FA3 feature), provide stub
     def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
         return None
+
+    def _flash_attn_with_kvcache_unsupported(*args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("flash_attn_with_kvcache is not supported on ROCm")
+
+    flash_attn_with_kvcache = _flash_attn_with_kvcache_unsupported
 
     # ROCm uses the C++ custom op for reshape_and_cache
     from vllm import _custom_ops as ops

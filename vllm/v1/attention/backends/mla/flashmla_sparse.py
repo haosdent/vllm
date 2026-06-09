@@ -28,7 +28,10 @@ from vllm.v1.attention.backend import (
     MultipleOf,
     SparseMLAAttentionImpl,
 )
-from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+from vllm.v1.attention.backends.fa_utils import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+)
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
@@ -729,7 +732,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         num_prefill_tokens = attn_metadata.num_prefill_tokens
 
         if num_prefill_tokens == 0:
-            return self._bf16_fa3_tokenwise_kernel(
+            return self._bf16_fa3_kvcache_decode_kernel(
                 q,
                 kv_c_and_k_pe_cache,
                 topk_indices,
@@ -742,7 +745,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         )
         if num_decode_tokens > 0:
             if use_fa3_decode:
-                attn_out[:num_decode_tokens] = self._bf16_fa3_tokenwise_kernel(
+                attn_out[:num_decode_tokens] = self._bf16_fa3_kvcache_decode_kernel(
                     q[:num_decode_tokens],
                     kv_c_and_k_pe_cache,
                     topk_indices[:num_decode_tokens],
@@ -790,6 +793,52 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             prefill_topk_indices,
         )
         return attn_out
+
+    def _bf16_fa3_kvcache_decode_kernel(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        req_id_per_token: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+    ) -> torch.Tensor:
+        num_tokens = q.shape[0]
+        q_nope, q_pe = torch.split(
+            q, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        topk_indices, topk_lens = triton_convert_req_index_to_global_index(
+            req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
+        )
+
+        flat_kv_cache = kv_c_and_k_pe_cache.view(-1, kv_c_and_k_pe_cache.shape[-1])
+        kv_c_cache = flat_kv_cache[:, : self.kv_lora_rank].view(
+            -1, 1, 1, self.kv_lora_rank
+        )
+        k_pe_cache = flat_kv_cache[:, self.kv_lora_rank :].view(
+            -1, 1, 1, self.qk_rope_head_dim
+        )
+
+        assert self.fa3_query_start_loc is not None
+        query_start_loc = self.fa3_query_start_loc[: num_tokens + 1]
+        return flash_attn_with_kvcache(
+            q=q_pe,
+            k_cache=k_pe_cache,
+            v_cache=kv_c_cache,
+            qv=q_nope,
+            cache_seqlens=topk_lens,
+            page_table=topk_indices,
+            cu_seqlens_q=query_start_loc,
+            max_seqlen_q=1,
+            softmax_scale=self.scale,
+            causal=True,
+            softcap=self.logits_soft_cap or 0.0,
+            return_softmax_lse=False,
+        )
 
     def _bf16_fa3_tokenwise_kernel(
         self,

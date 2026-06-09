@@ -118,6 +118,99 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    k=None,
+    v=None,
+    qv=None,
+    rotary_cos=None,
+    rotary_sin=None,
+    cache_seqlens=None,
+    cache_batch_idx=None,
+    cache_leftpad=None,
+    page_table=None,
+    cu_seqlens_q=None,
+    cu_seqlens_k_new=None,
+    max_seqlen_q=None,
+    rotary_seqlens=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    attention_chunk=None,
+    softcap=0.0,
+    rotary_interleaved=True,
+    scheduler_metadata=None,
+    num_splits=0,
+    pack_gqa=None,
+    sm_margin=0,
+    return_softmax_lse=False,
+    sinks=None,
+    out=None,
+):
+    if attention_chunk is not None:
+        raise NotImplementedError("FA3 kvcache wrapper does not support chunking")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    if isinstance(cache_seqlens, int):
+        cache_seqlens = torch.full(
+            (q.shape[0],),
+            cache_seqlens,
+            dtype=torch.int32,
+            device=q.device,
+        )
+    real_window_size = (-1, -1) if window_size is None else window_size
+    assert len(real_window_size) == 2
+
+    q, k_cache, v_cache, k, v, qv = [
+        maybe_contiguous(x) for x in (q, k_cache, v_cache, k, v, qv)
+    ]
+    out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
+        qv,
+        out,
+        cu_seqlens_q,
+        None,  # cu_seqlens_k
+        cu_seqlens_k_new,
+        None,  # seqused_q
+        cache_seqlens,
+        max_seqlen_q,
+        None,  # max_seqlen_k
+        page_table,
+        cache_batch_idx,
+        cache_leftpad,
+        rotary_cos,
+        rotary_sin,
+        rotary_seqlens,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        causal,
+        real_window_size[0],
+        real_window_size[1],
+        softcap,
+        rotary_interleaved,
+        scheduler_metadata,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        sinks,
+        1,  # cp_world_size
+        0,  # cp_rank
+        None,  # cp_tot_seqused_k
+    )
+    return (out, softmax_lse) if return_softmax_lse else out
+
+
 # NOTE only used in FA3
 def get_scheduler_metadata(
     batch_size,
