@@ -39,6 +39,8 @@ def test_noop_elimination(dtype, num_tokens, hidden_size, buffer_size):
             z = y.reshape(-1, 4096)
             # No-op reshape
             a = z.reshape(-1, 4096)
+            # No-op view
+            a = a.view(-1, 4096)
             # Final reshape that should remain
             b = a.reshape(-1, 128, 32)
             # No-op slice
@@ -81,6 +83,7 @@ def test_noop_elimination(dtype, num_tokens, hidden_size, buffer_size):
         # The initial slice on the positional embedding should remain.
         # The chain of reshapes should be fused into a single reshape.
         assert backend.op_count(torch.ops.aten.reshape.default) == 1
+        assert backend.op_count(torch.ops.aten.view.default) == 0
         assert backend.op_count(torch.ops.aten.slice.Tensor) == 1
         assert backend.op_count(torch.ops.aten.slice_scatter.default) == 0
 
