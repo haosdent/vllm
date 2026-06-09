@@ -141,6 +141,23 @@ _transform_sf_into_required_layout_impl: Callable[..., Any] | None = None
 
 
 @functools.cache
+def _import_vendored_deep_gemm():
+    """Import the vendored deep_gemm module bundled in the vLLM wheel."""
+    try:
+        module = importlib.import_module("vllm.third_party.deep_gemm")
+        logger.debug_once("Imported deep_gemm module from vllm.third_party.deep_gemm")
+        return module
+    except ImportError:
+        logger.debug_once("Vendored deep_gemm not found either")
+    except Exception as e:
+        # The vendored module may raise RuntimeError during _C.init()
+        # if JIT include files are missing (e.g. incomplete wheel).
+        logger.warning_once("Failed to import vendored deep_gemm: %s", e)
+
+    return None
+
+
+@functools.cache
 def _import_deep_gemm():
     """Import the deep_gemm module.
 
@@ -162,18 +179,49 @@ def _import_deep_gemm():
         )
 
     # 2. Fall back to the vendored copy bundled in the vLLM wheel.
-    try:
-        module = importlib.import_module("vllm.third_party.deep_gemm")
-        logger.debug_once("Imported deep_gemm module from vllm.third_party.deep_gemm")
-        return module
-    except ImportError:
-        logger.debug_once("Vendored deep_gemm not found either")
-    except Exception as e:
-        # The vendored module may raise RuntimeError during _C.init()
-        # if JIT include files are missing (e.g. incomplete wheel).
-        logger.warning_once("Failed to import vendored deep_gemm: %s", e)
+    return _import_vendored_deep_gemm()
 
-    return None
+
+def _fill_sparse_mla_symbols_from_vendored() -> None:
+    """Use vendored DeepGEMM for sparse MLA symbols missing upstream."""
+    global _fp8_fp4_mqa_logits_impl, _fp8_fp4_paged_mqa_logits_impl
+    global _get_paged_mqa_logits_metadata_impl
+
+    if (
+        _fp8_fp4_mqa_logits_impl is not None
+        and _fp8_fp4_paged_mqa_logits_impl is not None
+        and _get_paged_mqa_logits_metadata_impl is not None
+    ):
+        return
+
+    vendored_dg = _import_vendored_deep_gemm()
+    if vendored_dg is None:
+        return
+
+    had_missing_symbol = (
+        _fp8_fp4_mqa_logits_impl is None
+        or _fp8_fp4_paged_mqa_logits_impl is None
+        or _get_paged_mqa_logits_metadata_impl is None
+    )
+    _fp8_fp4_mqa_logits_impl = _fp8_fp4_mqa_logits_impl or getattr(
+        vendored_dg, "fp8_fp4_mqa_logits", None
+    )
+    _fp8_fp4_paged_mqa_logits_impl = _fp8_fp4_paged_mqa_logits_impl or getattr(
+        vendored_dg, "fp8_fp4_paged_mqa_logits", None
+    )
+    _get_paged_mqa_logits_metadata_impl = (
+        _get_paged_mqa_logits_metadata_impl
+        or getattr(vendored_dg, "get_paged_mqa_logits_metadata", None)
+    )
+    if had_missing_symbol and (
+        _fp8_fp4_mqa_logits_impl is not None
+        or _fp8_fp4_paged_mqa_logits_impl is not None
+        or _get_paged_mqa_logits_metadata_impl is not None
+    ):
+        logger.info_once(
+            "Using vendored DeepGEMM sparse MLA symbols missing from the "
+            "selected deep_gemm module."
+        )
 
 
 def _lazy_init() -> None:
@@ -231,6 +279,7 @@ def _lazy_init() -> None:
     _get_paged_mqa_logits_metadata_impl = getattr(
         _dg, "get_paged_mqa_logits_metadata", None
     )
+    _fill_sparse_mla_symbols_from_vendored()
     _tf32_hc_prenorm_gemm_impl = getattr(_dg, "tf32_hc_prenorm_gemm", None)
     _get_mn_major_tma_aligned_tensor_impl = getattr(
         _dg, "get_mn_major_tma_aligned_tensor", None
