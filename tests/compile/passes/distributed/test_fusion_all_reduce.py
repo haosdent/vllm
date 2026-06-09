@@ -135,6 +135,50 @@ class TestAllReduceGemmaRMSNormModel(torch.nn.Module):
         return [torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default]
 
 
+class TestAllReduceViewFusedAddRMSNormModel(torch.nn.Module):
+    def __init__(
+        self,
+        hidden_size=16,
+        token_num=16,
+        eps=1e-6,
+        dtype: torch.dtype = torch.float16,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.norm = [RMSNorm(hidden_size, eps) for _ in range(4)]
+        self.w = [torch.rand(hidden_size, hidden_size) for _ in range(3)]
+
+    def _metadata_view(self, x: torch.Tensor) -> torch.Tensor:
+        return x.view(-1, self.hidden_size)
+
+    def forward(self, x):
+        # Keep the first block direct. GLM-style MoE blocks add a metadata-only
+        # view between late MLP all-reduce and the next fused_add_rms_norm.
+        z = torch.relu(x)
+        x = resid = tensor_model_parallel_all_reduce(z)
+        y = self.norm[0](x)
+
+        z2 = torch.mm(y, self.w[0])
+        x2 = self._metadata_view(tensor_model_parallel_all_reduce(z2))
+        y2, resid = self.norm[1](x2, resid)
+
+        z3 = torch.mm(y2, self.w[1])
+        x3 = self._metadata_view(tensor_model_parallel_all_reduce(z3))
+        y3, resid = self.norm[2](x3, resid)
+
+        z4 = torch.mm(y3, self.w[2])
+        x4 = self._metadata_view(tensor_model_parallel_all_reduce(z4))
+        y4, resid = self.norm[3](x4, resid)
+        return y4
+
+    def ops_in_model_before(self):
+        return [torch.ops.vllm.all_reduce.default]
+
+    def ops_in_model_after(self):
+        return [torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default]
+
+
 class TestAllReduceRMSNormStaticQuantFP8Model(torch.nn.Module):
     quant_key = kFp8StaticTensorSym
 
@@ -255,6 +299,15 @@ class TestAllReduceFusedAddRMSNormStaticQuantFP4Model(torch.nn.Module):
         (TestAllReduceRMSNormModel, False, IS_AITER_FOUND),
         pytest.param(
             TestAllReduceGemmaRMSNormModel,
+            False,
+            False,
+            marks=pytest.mark.skipif(
+                current_platform.is_rocm(),
+                reason="Not supported on ROCm platform",
+            ),
+        ),
+        pytest.param(
+            TestAllReduceViewFusedAddRMSNormModel,
             False,
             False,
             marks=pytest.mark.skipif(
