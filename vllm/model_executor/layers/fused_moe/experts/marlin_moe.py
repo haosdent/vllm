@@ -7,6 +7,7 @@ from collections.abc import Callable
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -158,7 +159,7 @@ def _fused_marlin_moe(
         size_k=K,
         is_k_full=is_k_full,
         use_atomic_add=False,
-        use_fp32_reduce=True,
+        use_fp32_reduce=envs.VLLM_MARLIN_MOE_USE_FP32_REDUCE,
         is_zp_float=False,
     )
     if clamp_limit is not None and activation == MoEActivation.SILU:
@@ -217,7 +218,7 @@ def _fused_marlin_moe(
         size_k=N,
         is_k_full=is_k_full,
         use_atomic_add=False,
-        use_fp32_reduce=True,
+        use_fp32_reduce=envs.VLLM_MARLIN_MOE_USE_FP32_REDUCE,
         is_zp_float=False,
     )
 

@@ -146,6 +146,7 @@ if TYPE_CHECKING:
     VLLM_MLA_DISABLE: bool = False
     VLLM_FLASHMLA_SPARSE_FA3_DECODE: bool = False
     VLLM_FLASHMLA_SPARSE_FA3_PREFILL: bool = False
+    VLLM_MARLIN_MOE_USE_FP32_REDUCE: bool = True
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1295,6 +1296,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tokens. This avoids FlashMLA sparse prefill head padding on Hopper.
     "VLLM_FLASHMLA_SPARSE_FA3_PREFILL": lambda: bool(
         int(os.getenv("VLLM_FLASHMLA_SPARSE_FA3_PREFILL", "0"))
+    ),
+    # If set to 0, Marlin MoE accumulates directly in the output dtype instead
+    # of using the temporary FP32 reduction buffer.
+    "VLLM_MARLIN_MOE_USE_FP32_REDUCE": lambda: bool(
+        int(os.getenv("VLLM_MARLIN_MOE_USE_FP32_REDUCE", "1"))
     ),
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
