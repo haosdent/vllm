@@ -814,11 +814,16 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         topk_indices: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
     ) -> torch.Tensor:
-        if self._can_use_bf16_fa3_decode(
-            attn_metadata
-        ) or self._can_use_bf16_fa3_prefill(attn_metadata):
+        use_fa3_decode = self._can_use_bf16_fa3_decode(attn_metadata)
+        use_fa3_prefill = self._can_use_bf16_fa3_prefill(attn_metadata)
+        if use_fa3_decode or use_fa3_prefill:
             return self._forward_bf16_kv_fa3_decode_prefill(
-                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata,
+                use_fa3_decode=use_fa3_decode,
+                use_fa3_prefill=use_fa3_prefill,
             )
 
         # Convert per-request indices to global slots (decode) or workspace
@@ -871,6 +876,8 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
+        use_fa3_decode: bool,
+        use_fa3_prefill: bool,
     ) -> torch.Tensor:
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
@@ -888,7 +895,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             (attn_metadata.num_actual_tokens, self.num_heads, self.kv_lora_rank)
         )
         if num_decode_tokens > 0:
-            if self._can_use_bf16_fa3_decode(attn_metadata):
+            if use_fa3_decode:
                 attn_out[:num_decode_tokens] = self._bf16_fa3_tokenwise_kernel(
                     q[:num_decode_tokens],
                     kv_c_and_k_pe_cache,
@@ -910,7 +917,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     decode_topk_indices,
                 )
 
-        if self._can_use_bf16_fa3_prefill(attn_metadata):
+        if use_fa3_prefill:
             attn_out[num_decode_tokens:] = self._bf16_fa3_tokenwise_kernel(
                 q[num_decode_tokens:],
                 kv_c_and_k_pe_cache,
