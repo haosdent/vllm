@@ -413,7 +413,10 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not self._fused_output_is_reduced
         ):
+            if states.shape[-1] != trunc_size:
+                states = states[..., :trunc_size].contiguous()
             states = tensor_model_parallel_all_reduce(states)
+            return states
 
         return states[..., :trunc_size]
 
