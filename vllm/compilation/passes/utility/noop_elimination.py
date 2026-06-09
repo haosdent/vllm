@@ -17,7 +17,7 @@ logger = init_logger(__name__)
 
 class NoOpEliminationPass(VllmInductorPass):
     """
-    This is an inductor pass that removes redundant reshape/slice operations.
+    This is an inductor pass that removes redundant view/reshape/slice operations.
     It is required for RMSNorm-quant fusion to work properly.
     That's because apply_fp8_linear adds a reshape, which is redundant
     in the 2D-case. Additionally, torch internal no-op elimination pass does
@@ -67,13 +67,15 @@ class NoOpEliminationPass(VllmInductorPass):
     @VllmInductorPass.time_and_log
     def __call__(self, graph: torch.fx.Graph) -> None:
         count = 0
+        view_ops = (torch.ops.aten.reshape.default, torch.ops.aten.view.default)
+
         # Remove no-op reshapes/views:
         for node in graph.nodes:
-            if is_func(node, torch.ops.aten.reshape.default):
+            if any(is_func(node, op) for op in view_ops):
                 # Case 1: rewrite reshape chains to reshapes on the base tensor
                 input = node.args[0]
                 # If the input is a reshape, rebind to that node
-                if is_func(input, torch.ops.aten.reshape.default):
+                if any(is_func(input, op) for op in view_ops):
                     # The new input is guaranteed not to be a reshape,
                     # because we process nodes in order
                     node.update_arg(0, input.args[0])
@@ -82,7 +84,7 @@ class NoOpEliminationPass(VllmInductorPass):
                         count += 1
 
             # remove reshape/slice if it produces the original shape
-            if is_func(node, torch.ops.aten.reshape.default) or is_func(
+            if any(is_func(node, op) for op in view_ops) or is_func(
                 node, torch.ops.aten.slice.Tensor
             ):
                 input = node.args[0]
