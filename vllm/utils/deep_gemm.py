@@ -198,11 +198,6 @@ def _fill_sparse_mla_symbols_from_vendored() -> None:
     if vendored_dg is None:
         return
 
-    had_missing_symbol = (
-        _fp8_fp4_mqa_logits_impl is None
-        or _fp8_fp4_paged_mqa_logits_impl is None
-        or _get_paged_mqa_logits_metadata_impl is None
-    )
     _fp8_fp4_mqa_logits_impl = _fp8_fp4_mqa_logits_impl or getattr(
         vendored_dg, "fp8_fp4_mqa_logits", None
     )
@@ -213,7 +208,7 @@ def _fill_sparse_mla_symbols_from_vendored() -> None:
         _get_paged_mqa_logits_metadata_impl
         or getattr(vendored_dg, "get_paged_mqa_logits_metadata", None)
     )
-    if had_missing_symbol and (
+    if (
         _fp8_fp4_mqa_logits_impl is not None
         or _fp8_fp4_paged_mqa_logits_impl is not None
         or _get_paged_mqa_logits_metadata_impl is not None
