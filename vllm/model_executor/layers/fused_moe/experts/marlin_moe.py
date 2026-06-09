@@ -8,6 +8,7 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -54,6 +55,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+
+def _should_use_marlin_moe_atomic_add() -> bool:
+    return envs.VLLM_MARLIN_MOE_USE_ATOMIC_ADD
 
 
 def _fused_marlin_moe(
@@ -133,6 +138,8 @@ def _fused_marlin_moe(
     elif input_dtype == torch.float8_e4m3fn:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
 
+    use_atomic_add = _should_use_marlin_moe_atomic_add()
+
     intermediate_cache1 = ops.moe_wna16_marlin_gemm(
         gate_up_input,
         intermediate_cache1,
@@ -157,7 +164,7 @@ def _fused_marlin_moe(
         size_n=w13_num_shards * N,
         size_k=K,
         is_k_full=is_k_full,
-        use_atomic_add=False,
+        use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
     )
@@ -216,7 +223,7 @@ def _fused_marlin_moe(
         size_n=K,
         size_k=N,
         is_k_full=is_k_full,
-        use_atomic_add=False,
+        use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
     )
