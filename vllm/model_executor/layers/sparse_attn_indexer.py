@@ -96,6 +96,12 @@ def sparse_attn_indexer(
     topk_indices_buffer: torch.Tensor,
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
+    k_norm_weight: torch.Tensor | None = None,
+    k_norm_bias: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    cos_sin_cache: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
+    rot_dim: int = 0,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -164,13 +170,39 @@ def sparse_attn_indexer(
         # scale_fmt can be None, but the function expects str
         assert scale_fmt is not None
         assert not use_fp4_cache, "Unfused FP4 Insert is not supported yet"
-        ops.indexer_k_quant_and_cache(
-            k,
-            kv_cache,
-            slot_mapping,
-            quant_block_size,
-            scale_fmt,
-        )
+        if k_norm_weight is not None:
+            # Fused: LayerNorm + RoPE + fp8 quant + cache insert in one kernel.
+            # `k` here is the raw post-GEMM K (pre-norm, pre-rope).
+            # Fused-K params are all-or-nothing: a partial set silently caches
+            # mis-processed K (missing bias -> C++ null deref; rot_dim == 0 ->
+            # RoPE skipped). Require the whole bundle up front.
+            assert (
+                k_norm_bias is not None
+                and cos_sin_cache is not None
+                and positions is not None
+                and rot_dim > 0
+            ), "fused indexer-K needs k_norm_bias, cos_sin_cache, positions, rot_dim>0"
+            ops.indexer_k_norm_rope_quant_and_cache(
+                k,
+                k_norm_weight,
+                k_norm_bias,
+                norm_eps,
+                cos_sin_cache,
+                positions[:num_tokens],
+                rot_dim,
+                kv_cache,
+                slot_mapping,
+                quant_block_size,
+                scale_fmt,
+            )
+        else:
+            ops.indexer_k_quant_and_cache(
+                k,
+                kv_cache,
+                slot_mapping,
+                quant_block_size,
+                scale_fmt,
+            )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
@@ -390,6 +422,12 @@ def sparse_attn_indexer_fake(
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
+    k_norm_weight: torch.Tensor | None = None,
+    k_norm_bias: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    cos_sin_cache: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
+    rot_dim: int = 0,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -451,9 +489,26 @@ class SparseAttnIndexer(CustomOp):
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         k: torch.Tensor,
         weights: torch.Tensor,
+        k_norm_weight: torch.Tensor | None = None,
+        k_norm_bias: torch.Tensor | None = None,
+        norm_eps: float = 1e-6,
+        cos_sin_cache: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        rot_dim: int = 0,
     ):
         if current_platform.is_cuda() or current_platform.is_xpu():
-            return self.forward_cuda(hidden_states, q_quant, k, weights)
+            return self.forward_cuda(
+                hidden_states,
+                q_quant,
+                k,
+                weights,
+                k_norm_weight=k_norm_weight,
+                k_norm_bias=k_norm_bias,
+                norm_eps=norm_eps,
+                cos_sin_cache=cos_sin_cache,
+                positions=positions,
+                rot_dim=rot_dim,
+            )
         elif current_platform.is_rocm():
             return self.forward_hip(hidden_states, q_quant, k, weights)
         else:
@@ -468,6 +523,12 @@ class SparseAttnIndexer(CustomOp):
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         k: torch.Tensor,
         weights: torch.Tensor,
+        k_norm_weight: torch.Tensor | None = None,
+        k_norm_bias: torch.Tensor | None = None,
+        norm_eps: float = 1e-6,
+        cos_sin_cache: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        rot_dim: int = 0,
     ):
         # FP8 path: single tensor (per-token scale is folded into `weights`).
         # FP4 path: (values, scales) tuple with scales required by the kernel.
@@ -492,6 +553,12 @@ class SparseAttnIndexer(CustomOp):
             self.topk_indices_buffer,
             self.skip_k_cache_insert,
             self.use_fp4_cache,
+            k_norm_weight,
+            k_norm_bias,
+            norm_eps,
+            cos_sin_cache,
+            positions,
+            rot_dim,
         )
 
     def forward_xpu(
