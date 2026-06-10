@@ -36,6 +36,10 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
+# persistent_topk needs >= this many decode rows to amortize its launch
+# overhead (see the routing comment in the decode branch below).
+_PERSISTENT_TOPK_MIN_ROWS = 9
+
 
 def _gather_workspace_shapes(
     total_seq_lens: int,
@@ -334,7 +338,18 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):
+        # persistent_topk's worst-case-sized launch (1024 threads, large smem
+        # carveout, RadixRowState memset) stalls ~9us per layer in the decode
+        # cudagraph. At small decode batches that per-launch stall dominates
+        # per-token cost (~6% TPOT at batch 1), so route them to the light
+        # per-row kernel; persistent_topk stays for larger batches where its
+        # throughput wins. num_rows is capture-time static per cudagraph, so
+        # this branch is graph-safe.
+        if (
+            current_platform.is_cuda()
+            and topk_tokens in (512, 1024, 2048)
+            and num_rows >= _PERSISTENT_TOPK_MIN_ROWS
+        ):
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
