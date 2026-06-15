@@ -4,10 +4,63 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.config import CacheConfig
+from vllm import envs
+from vllm.config import CacheConfig, get_current_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.platforms import current_platform
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.torch_utils import aux_stream, direct_register_custom_op
+
+
+def _dsa_attn_overlap_impl(
+    hidden_states: torch.Tensor,
+    q_c: torch.Tensor,
+    positions: torch.Tensor,
+    prefix: str,
+    q_out_dim: int,
+) -> torch.Tensor:
+    """Run q_b_proj (default stream) concurrently with the whole DSA indexer
+    (aux stream), then return q. The indexer writes the shared topk buffer as a
+    side effect. This op is OPAQUE to torch.compile and is NOT a splitting op,
+    so the FULL decode cudagraph captures the multi-stream overlap once and
+    replays it cheaply (mirrors the shared-experts overlap; no breakable
+    cudagraph, no eager-break, no un-capture penalty)."""
+    self = get_forward_context().no_compile_layers[prefix]
+    idx = self.indexer
+    stream = aux_stream()
+    q, _ = maybe_execute_in_parallel(
+        lambda: self.q_b_proj(q_c)[0],
+        lambda: idx.forward_via_function(
+            hidden_states, q_c, positions, self.indexer_rope_emb
+        ),
+        self._dsa_overlap_events[0],
+        self._dsa_overlap_events[1],
+        stream,
+    )
+    return q
+
+
+def _dsa_attn_overlap_fake(
+    hidden_states: torch.Tensor,
+    q_c: torch.Tensor,
+    positions: torch.Tensor,
+    prefix: str,
+    q_out_dim: int,
+) -> torch.Tensor:
+    return hidden_states.new_empty(
+        (hidden_states.shape[0], q_out_dim), dtype=hidden_states.dtype
+    )
+
+
+direct_register_custom_op(
+    op_name="dsa_attn_overlap",
+    op_func=_dsa_attn_overlap_impl,
+    mutates_args=["hidden_states"],
+    fake_impl=_dsa_attn_overlap_fake,
+)
 
 
 @dataclass
@@ -116,6 +169,29 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.prefix = prefix
 
+        # Captured multi-stream overlap of q_b_proj || the DSA indexer
+        # (opt-in via VLLM_GLM_DSA_V4_ATTN). Implemented as a captured opaque
+        # op (NOT a splitting op, NOT eager-break) so the FULL decode cudagraph
+        # captures the overlap and replays it cheaply.
+        self.use_glm_dsa_v4 = (
+            envs.VLLM_GLM_DSA_V4_ATTN
+            and self.is_sparse
+            and not self.skip_topk
+            and self.indexer is not None
+            and getattr(self.indexer, "use_fused_indexer_k", False)
+            and self.q_b_proj is not None
+            and self.q_lora_rank is not None
+            and current_platform.is_cuda_alike()
+        )
+        if self.use_glm_dsa_v4:
+            self._dsa_overlap_events = [torch.cuda.Event(), torch.cuda.Event()]
+            static_fwd_ctx = (
+                get_current_vllm_config().compilation_config.static_forward_context
+            )
+            if prefix in static_fwd_ctx:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            static_fwd_ctx[prefix] = self
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -142,7 +218,20 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 dim=-1,
             )
             q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
+            if self.use_glm_dsa_v4:
+                # q_b_proj || whole DSA indexer, captured by the FULL decode
+                # cudagraph (the indexer writes the topk buffer as a side
+                # effect, so the separate self.indexer(...) call below is
+                # skipped).
+                q = torch.ops.vllm.dsa_attn_overlap(
+                    hidden_states,
+                    q_c,
+                    positions,
+                    self.prefix,
+                    self.num_heads * self.qk_head_dim,
+                )
+            else:
+                q = self.q_b_proj(q_c)[0]
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -165,7 +254,12 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
 
-        if self.indexer and self.is_sparse and not self.skip_topk:
+        if (
+            self.indexer
+            and self.is_sparse
+            and not self.skip_topk
+            and not self.use_glm_dsa_v4
+        ):
             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
 
         if llama_4_scaling is not None:

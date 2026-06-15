@@ -24,6 +24,11 @@ if TYPE_CHECKING:
     # cudagraph, so it is off by default to avoid a small short-context
     # decode regression.
     VLLM_FUSED_INDEXER_K: bool = False
+    # Opt-in captured multi-stream overlap of q_b_proj with the DSA indexer for
+    # GLM-DSA decode. Implemented as an opaque, non-splitting custom op captured
+    # by the full decode cudagraph (NOT eager-break / breakable cudagraph).
+    # Requires VLLM_FUSED_INDEXER_K=1.
+    VLLM_GLM_DSA_V4_ATTN: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
@@ -694,6 +699,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in fused DSA indexer-K kernel (off by default; see decl above).
     "VLLM_FUSED_INDEXER_K": lambda: bool(
         int(os.getenv("VLLM_FUSED_INDEXER_K", "0"))
+    ),
+    "VLLM_GLM_DSA_V4_ATTN": lambda: bool(
+        int(os.getenv("VLLM_GLM_DSA_V4_ATTN", "0"))
     ),
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(
