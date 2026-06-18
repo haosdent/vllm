@@ -1018,6 +1018,22 @@ class DeepseekV2MLAAttention(nn.Module):
                 elif 0 <= layer_id < len(_index_topk_pattern):
                     _skip_topk = _index_topk_pattern[layer_id] == "S"
 
+            # GLM-5.2 IndexShare: layers whose ``indexer_types[i] == "shared"`` reuse the
+            # previous "full" layer's top-k token indices (carried in the shared
+            # ``topk_indices_buffer``) instead of running their own indexer. This matches
+            # ``modeling_glm_moe_dsa.py`` (``skip_topk = indexer_types[layer_idx] ==
+            # "shared"``). The indexer submodule is still constructed for buffer access but
+            # is never invoked for these layers (mla.py gates it on ``not skip_topk``), so
+            # their checkpoint-absent indexer weights stay unused.
+            indexer_types = getattr(config, "indexer_types", None)
+            if indexer_types is not None:
+                _layer_idx = extract_layer_index(prefix)
+                if (
+                    0 <= _layer_idx < len(indexer_types)
+                    and indexer_types[_layer_idx] == "shared"
+                ):
+                    _skip_topk = True
+
         else:
             self.indexer_rope_emb = None
             self.indexer = None
