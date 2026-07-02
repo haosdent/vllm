@@ -111,26 +111,50 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
         assert w1.dtype == torch.uint8
         assert w2.dtype == torch.uint8
 
-        # Dequantize w1 from packed NVFP4 to fp16/bf16
+        # Compact fast path: for decode (n_sel = B*top_k << E), dequant ONLY the
+        # selected experts and remap topk_ids to a compact [0, n_sel) space,
+        # avoiding a full-E bf16 materialization. Requires expert_map is None (a
+        # compact remap is incompatible with an EP expert_map). Graph-safe:
+        # topk_ids has a static shape, so n_sel is a compile-time constant per
+        # captured batch size.
         w13_global_scale = self.quant_config.g1_alphas
+        w2_global_scale = self.quant_config.g2_alphas
+        _dt = hidden_states.dtype
+        E = w1.shape[0]
+        n_sel = topk_ids.numel()
+
+        if expert_map is None and n_sel < E:
+            flat_ids = topk_ids.reshape(-1).long()
+
+            def _sel(t):
+                # Per-expert tensor -> gather selected experts; else pass through.
+                if torch.is_tensor(t) and t.dim() >= 1 and t.shape[0] == E:
+                    return t.index_select(0, flat_ids)
+                return t
+
+            # Remap to a compact expert space; token i's slot j -> expert i*K+j.
+            topk_ids = torch.arange(
+                n_sel, device=topk_ids.device, dtype=topk_ids.dtype
+            ).reshape(topk_ids.shape)
+            global_num_experts = n_sel
+        else:
+
+            def _sel(t):
+                return t
 
         w1_dequant = dequantize_to_dtype(
-            tensor_fp4=w1,
-            tensor_sf=self.w1_scale_val,
-            global_scale=w13_global_scale,
-            dtype=hidden_states.dtype,
+            tensor_fp4=_sel(w1),
+            tensor_sf=_sel(self.w1_scale_val),
+            global_scale=_sel(w13_global_scale),
+            dtype=_dt,
             block_size=16,
             swizzle=False,
         )
-
-        # Dequantize w2 from packed NVFP4 to fp16/bf16
-        w2_global_scale = self.quant_config.g2_alphas
-
         w2_dequant = dequantize_to_dtype(
-            tensor_fp4=w2,
-            tensor_sf=self.w2_scale_val,
-            global_scale=w2_global_scale,
-            dtype=hidden_states.dtype,
+            tensor_fp4=_sel(w2),
+            tensor_sf=_sel(self.w2_scale_val),
+            global_scale=_sel(w2_global_scale),
+            dtype=_dt,
             block_size=16,
             swizzle=False,
         )
