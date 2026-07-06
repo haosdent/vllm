@@ -282,7 +282,6 @@ logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
 
-
 def _detect_output_quant_key(
     output: torch.Tensor,
     output_scale: torch.Tensor | None,
@@ -519,6 +518,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             compile_native=True,
         )
 
+        # GLM DSA attn-prep overlap (VLLM_GLM_ATTN_PREP_OVERLAP=4): persistent
+        # buffer + pre-allocated scratch for the hoisted decode mqa query.
+        # Defaults keep the standard path untouched; setup_precomputed_mqa()
+        # (called by the MLA wrapper when mode == 4, fp8 decode only) allocates
+        # them and flips use_precomputed_mqa on. The scratch means the hoisted
+        # bmm + concat + quant do ZERO graph-pool allocation on the main stream,
+        # avoiding the concurrent main+aux capture-time aliasing that corrupts.
+        self.use_precomputed_mqa = False
+        self.mqa_buf_capacity = 0
+        self._mqa_q_buf: torch.Tensor | None = None
+        self._mqa_bmm_scratch: torch.Tensor | None = None
+        self._mqa_cat_scratch: torch.Tensor | None = None
+        # Mode-4a: hoist ONLY the bmm; concat+quant stay eager in forward_impl.
+        # _mqa_ql_nope_buf holds the persistent bmm output (N, B, L flat).
+        self.mqa_bmm_only = False
+        self._mqa_ql_nope_buf: torch.Tensor | None = None
+
     @property
     def chunked_prefill_workspace_size(self) -> int:
         if self._chunked_prefill_workspace_size is None:
@@ -535,7 +551,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
+        skip_kv_cache_update: bool = False,
     ) -> torch.Tensor:
+        # skip_kv_cache_update: the caller has ALREADY written kv_c_normed/k_pe
+        # into the KV cache (e.g. the GLM DSA attn-prep overlap op hoists the
+        # write to overlap the indexer). The attention op is still ordered after
+        # that write via its data dependency on kv_c_normed. Default False.
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(
                 q,
@@ -562,14 +583,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             assert isinstance(slot_mapping, dict), (
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_c_normed,
-                k_pe,
-                self_kv_cache,
-                slot_mapping.get(self.layer_name),
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            if not skip_kv_cache_update:
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_c_normed,
+                    k_pe,
+                    self_kv_cache,
+                    slot_mapping.get(self.layer_name),
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -582,13 +604,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             return output
         else:
             encoded = _encode_layer_name(self.layer_name)
-            kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
-                kv_c_normed,
-                k_pe,
-                encoded,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            if skip_kv_cache_update:
+                # Write already done by the caller; the attention op below is
+                # ordered after it via its data dependency on kv_c_normed, so a
+                # placeholder dep tensor suffices.
+                kv_cache_dummy_dep = torch.empty(
+                    0, dtype=kv_c_normed.dtype, device=kv_c_normed.device
+                )
+            else:
+                kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
+                    kv_c_normed,
+                    k_pe,
+                    encoded,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             torch.ops.vllm.unified_mla_attention_with_output(
                 q,
@@ -599,6 +629,196 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
             return output
+
+    def setup_precomputed_mqa(self, bmm_only: bool = False) -> None:
+        """Allocate the persistent mqa buffer + shared scratch for the hoisted
+        decode query (GLM DSA attn-prep overlap mode 4, fp8 decode only). All
+        sized to the max cudagraph capture size. The captured prep op computes
+        the query with ZERO graph-pool allocation on the main stream (bmm ->
+        bmm_scratch, concat -> cat_scratch, quant -> _mqa_q_buf), so it never
+        allocates concurrently with the aux-stream indexer during capture (the
+        aliasing that corrupted the earlier per-step-alloc version). forward_impl
+        reads _mqa_q_buf across the eager-break (stable address, never freed).
+        The scratch is reused every layer (prep ops run serially on the main
+        stream, each consuming its scratch before returning).
+
+        bmm_only (mode 4a): hoist ONLY the W_UK-absorb bmm. A single persistent
+        buffer holds the bmm output (N, B, L flat); forward_impl reads it and runs
+        concat+quant eagerly. Isolates the shared-cuBLAS-workspace bmm."""
+        capture_sizes = self._vllm_config.compilation_config.cudagraph_capture_sizes
+        cap = max(capture_sizes) if capture_sizes else 0
+        if cap == 0:
+            return  # no cudagraph capture -> mode-4 read stays off (recompute)
+        fp8 = (
+            is_quantized_kv_cache(self.kv_cache_dtype)
+            and self.impl.supports_quant_query_input
+        )
+        if not fp8 or self.q_pad_num_heads is not None or self.impl.dcp_world_size > 1:
+            return  # hoist only supports the plain fp8 decode path
+        self.mqa_buf_capacity = cap
+        self.mqa_bmm_only = bmm_only
+        dev = current_platform.device_type
+        adt = torch.get_default_dtype()
+        n = self.num_heads
+        L = self.kv_lora_rank
+        lr = self.kv_lora_rank + self.qk_rope_head_dim
+        if bmm_only:
+            # 4a: one persistent buffer holds the bmm output (N, B, L flat), read
+            # across the eager-break; concat+quant run eagerly in forward_impl.
+            self._mqa_ql_nope_buf = torch.empty(n * cap * L, dtype=adt, device=dev)
+        else:
+            # Final fp8 query buffer (concat of ql_nope + q_pe); scale is the
+            # static self._q_scale, already a persistent buffer.
+            self._mqa_q_buf = torch.empty(cap, n, lr, dtype=_FP8_DTYPE, device=dev)
+            # Flat scratch, viewed contiguously per-step: bmm out [n, B, L] and
+            # the bf16 concat [B, n, lr].
+            self._mqa_bmm_scratch = torch.empty(n * cap * L, dtype=adt, device=dev)
+            self._mqa_cat_scratch = torch.empty(cap * n * lr, dtype=adt, device=dev)
+        self.use_precomputed_mqa = True
+
+    def precompute_mqa_bmm_into_buffer(self, q: torch.Tensor) -> None:
+        """Mode-4a hoist entry: compute ONLY the W_UK-absorb bmm into the
+        persistent ql_nope buffer (plain torch.bmm path). No concat, no quant —
+        forward_impl runs those eagerly. Isolates the shared-cuBLAS-workspace bmm
+        to test the mode-4 corruption hypothesis. setup_precomputed_mqa restricts
+        4a to the plain fp8 decode path (q_pad_num_heads None, dcp_world_size 1),
+        so the aiter / padded / DCP variants of compute_mqa_query are not reached."""
+        mqa_q_nope, _ = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        mqa_q_nope = mqa_q_nope.transpose(0, 1)  # (B, N, P) -> (N, B, P)
+        N, B, P = mqa_q_nope.shape
+        _, _, L = self.W_UK_T.shape
+        out = self._mqa_ql_nope_buf[: N * B * L].view(N, B, L)
+        # (N, B, P) x (N, P, L) -> (N, B, L), into the persistent buffer.
+        torch.bmm(mqa_q_nope, self.W_UK_T, out=out)
+
+    def _finish_mqa_from_precomputed_bmm(
+        self, mqa_q: torch.Tensor, fp8_attention: bool, B: int
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Mode-4a: finish the decode query from the hoisted bmm output. Reads the
+        persistent ql_nope buffer, re-derives q_pe from q (cheap view), then runs
+        the SAME eager concat+quant as the non-hoisted path (the standard
+        _decode_concat_quant_fp8_op CustomOp)."""
+        _, mqa_q_pe = mqa_q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        N = self.num_heads
+        L = self.W_UK_T.shape[-1]
+        mqa_ql_nope = self._mqa_ql_nope_buf[: N * B * L].view(N, B, L).transpose(0, 1)
+        if fp8_attention and self.impl.supports_quant_query_input:
+            return self._decode_concat_quant_fp8_op(mqa_ql_nope, mqa_q_pe, self._q_scale)
+        return (mqa_ql_nope, mqa_q_pe)
+
+    def compute_mqa_query(
+        self,
+        mqa_q: torch.Tensor,
+        fp8_attention: bool,
+        eager_quant: bool = False,
+        out_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Topk-INDEPENDENT decode query preprocessing: split q into
+        (nope, pe), absorb W_UK into the nope part (bmm), and optionally fp8-
+        quantize. Returns the query object forward_mqa consumes (a fp8 pair, a
+        (ql_nope, q_pe) tuple, or a cat'd tensor for DCP). Extracted verbatim
+        from forward_impl so the DSA attn-prep overlap op can precompute it on
+        the default stream concurrent with the indexer; default path unchanged.
+        """
+        mqa_q_nope, mqa_q_pe = mqa_q.split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+
+        # Convert from (B, N, P) to (N, B, P)
+        mqa_q_nope = mqa_q_nope.transpose(0, 1)
+
+        if self.q_pad_num_heads is not None:
+            B, N, L = mqa_q_pe.shape
+            mqa_pe_padded = mqa_q_pe.new_empty((B, self.q_pad_num_heads, L))
+            mqa_pe_padded.resize_((B, N, L))
+            mqa_pe_padded.copy_(mqa_q_pe)
+            mqa_q_pe = mqa_pe_padded
+
+        if self.is_aiter_triton_fp4_bmm_enabled:
+            from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
+
+            mqa_ql_nope = batched_gemm_a16wfp4(
+                mqa_q_nope,
+                self.W_K,
+                self.W_K_scale,
+                transpose_bm=True,
+                prequant=True,
+                y_scale=self._q_scale if fp8_attention else None,
+            )
+        elif self.is_aiter_triton_fp8_bmm_enabled:
+            # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
+            mqa_ql_nope = rocm_aiter_ops.triton_fp8_bmm(
+                mqa_q_nope,
+                self.W_K,
+                self.W_K_scale,
+                group_size=128,
+                transpose_bm=True,
+            )
+        else:
+            # Pads the head_dim if necessary (for the underlying kernel)
+            N, B, P = mqa_q_nope.shape
+            _, _, L = self.W_UK_T.shape
+
+            if self.q_pad_num_heads is not None:
+                mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
+                mqa_ql_nope.resize_((N, B, L))
+            elif out_scratch is not None:
+                # Mode-4 hoist: contiguous [N, B, L] view of the pre-allocated
+                # flat scratch — no graph-pool alloc on the main stream.
+                mqa_ql_nope = out_scratch[0][: N * B * L].view(N, B, L)
+            else:
+                mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
+
+            # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+            torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
+
+            # Convert from (N, B, L) to (B, N, L)
+            mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
+
+        if fp8_attention and self.impl.supports_quant_query_input:
+            assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
+            assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
+            if out_scratch is not None:
+                # Mode-4 hoist: concat into the pre-allocated scratch and quant
+                # directly into the persistent fp8 buffer. Zero graph-pool alloc
+                # on the main stream (the concurrent main+aux capture-time
+                # allocation is what aliased and corrupted). Matches the eager
+                # per-tensor static quant of _decode_concat_quant_fp8_op.
+                _, cb, out_buf = out_scratch
+                b, nh, _ = mqa_ql_nope.shape
+                lr = self.kv_lora_rank + self.qk_rope_head_dim
+                cat_view = cb[: b * nh * lr].view(b, nh, lr)
+                torch.cat((mqa_ql_nope, mqa_q_pe), dim=-1, out=cat_view)
+                ops.scaled_fp8_quant(
+                    cat_view.reshape(b, -1),
+                    self._q_scale,
+                    output=out_buf[:b].view(b, -1),
+                    group_shape=(-1, -1),
+                )
+                mqa_q = out_buf[:b]
+            elif eager_quant:
+                # Called from inside a FULL-graph-captured op (the DSA attn-prep
+                # overlap, mode 4): invoke the eager CUDA quant directly instead
+                # of the CustomOp __call__, which under custom_ops=['none']
+                # dispatches to a torch.compile'd forward and would trigger a
+                # compile in the capture context (hang). forward_cuda is the
+                # same fused quant, numerically equivalent.
+                mqa_q = self._decode_concat_quant_fp8_op.forward_cuda(
+                    mqa_ql_nope, mqa_q_pe, self._q_scale
+                )
+            else:
+                mqa_q = self._decode_concat_quant_fp8_op(
+                    mqa_ql_nope, mqa_q_pe, self._q_scale
+                )
+        else:
+            mqa_q = (mqa_ql_nope, mqa_q_pe)
+        if self.impl.dcp_world_size > 1:
+            assert not fp8_attention, "DCP not support fp8 kvcache now."
+            # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+            mqa_q = torch.cat(mqa_q, dim=-1)
+            # mqa_q do allgather in head dim.
+            mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+        return mqa_q
 
     def forward_impl(
         self,
@@ -702,71 +922,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             mqa_q = q[:num_mqa_tokens]
             mqa_output_slice = output[:num_mqa_tokens]
 
-            mqa_q_nope, mqa_q_pe = mqa_q.split(
-                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
-
-            # Convert from (B, N, P) to (N, B, P)
-            mqa_q_nope = mqa_q_nope.transpose(0, 1)
-
-            if self.q_pad_num_heads is not None:
-                B, N, L = mqa_q_pe.shape
-                mqa_pe_padded = mqa_q_pe.new_empty((B, self.q_pad_num_heads, L))
-                mqa_pe_padded.resize_((B, N, L))
-                mqa_pe_padded.copy_(mqa_q_pe)
-                mqa_q_pe = mqa_pe_padded
-
-            if self.is_aiter_triton_fp4_bmm_enabled:
-                from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
-
-                mqa_ql_nope = batched_gemm_a16wfp4(
-                    mqa_q_nope,
-                    self.W_K,
-                    self.W_K_scale,
-                    transpose_bm=True,
-                    prequant=True,
-                    y_scale=self._q_scale if fp8_attention else None,
-                )
-            elif self.is_aiter_triton_fp8_bmm_enabled:
-                # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
-                mqa_ql_nope = rocm_aiter_ops.triton_fp8_bmm(
-                    mqa_q_nope,
-                    self.W_K,
-                    self.W_K_scale,
-                    group_size=128,
-                    transpose_bm=True,
-                )
-            else:
-                # Pads the head_dim if necessary (for the underlying kernel)
-                N, B, P = mqa_q_nope.shape
-                _, _, L = self.W_UK_T.shape
-
-                if self.q_pad_num_heads is not None:
-                    mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
-                    mqa_ql_nope.resize_((N, B, L))
+            # Topk-INDEPENDENT query prep (split + W_UK absorb bmm + fp8 quant).
+            # mode 4 (VLLM_GLM_ATTN_PREP_OVERLAP=4) hoists this into the DSA
+            # attn-prep overlap op, which writes it into the PERSISTENT mqa
+            # buffer; read that same buffer here (stable address, no clear).
+            # The capacity gate keeps eager prefill (tokens > capture size) on
+            # the inline path. Default path (use_precomputed_mqa False) is
+            # byte-identical.
+            if self.use_precomputed_mqa and num_mqa_tokens <= self.mqa_buf_capacity:
+                if self.mqa_bmm_only:
+                    # 4a: bmm precomputed in the buffer; run split-pe + concat +
+                    # fp8 quant EAGERLY here (quant stays off the aux overlap).
+                    mqa_q = self._finish_mqa_from_precomputed_bmm(
+                        mqa_q, fp8_attention, num_mqa_tokens
+                    )
                 else:
-                    mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
-
-                # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
-
-                # Convert from (N, B, L) to (B, N, L)
-                mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
-
-            if fp8_attention and self.impl.supports_quant_query_input:
-                assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
-                assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-                mqa_q = self._decode_concat_quant_fp8_op(
-                    mqa_ql_nope, mqa_q_pe, self._q_scale
-                )
+                    mqa_q = self._mqa_q_buf[:num_mqa_tokens]
             else:
-                mqa_q = (mqa_ql_nope, mqa_q_pe)
-            if self.impl.dcp_world_size > 1:
-                assert not fp8_attention, "DCP not support fp8 kvcache now."
-                # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
-                mqa_q = torch.cat(mqa_q, dim=-1)
-                # mqa_q do allgather in head dim.
-                mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+                mqa_q = self.compute_mqa_query(mqa_q, fp8_attention)
 
             # call decode attn
             if not is_sparse_impl:

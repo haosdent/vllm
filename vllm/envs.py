@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     # by the full decode cudagraph (NOT eager-break / breakable cudagraph).
     # Requires VLLM_FUSED_INDEXER_K=1.
     VLLM_GLM_DSA_V4_ATTN: bool = False
+    VLLM_GLM_ATTN_PREP_OVERLAP: int = 0
+    VLLM_GLM_ATTN_PREP_MQA_BMM_ONLY: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
@@ -702,6 +704,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM_DSA_V4_ATTN": lambda: bool(
         int(os.getenv("VLLM_GLM_DSA_V4_ATTN", "0"))
+    ),
+    "VLLM_GLM_ATTN_PREP_OVERLAP": lambda: int(
+        os.getenv("VLLM_GLM_ATTN_PREP_OVERLAP", "0")
+    ),
+    "VLLM_GLM_ATTN_PREP_MQA_BMM_ONLY": lambda: bool(
+        int(os.getenv("VLLM_GLM_ATTN_PREP_MQA_BMM_ONLY", "0"))
     ),
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(
