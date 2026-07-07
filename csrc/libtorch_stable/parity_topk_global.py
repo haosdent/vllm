@@ -54,6 +54,7 @@ def _run_case(
     block_size: int,
     block_table_blocks: int | None = None,
     sorted_asc: bool = False,
+    num_pool_blocks: int | None = None,
 ) -> None:
     num_rows = lengths.numel()
     assert num_rows > 32
@@ -66,6 +67,10 @@ def _run_case(
         else block_table_blocks
     )
     block_table = _make_block_table(num_rows, num_blocks)
+    # Large enough that every (valid, arange) block_table entry is in-pool, so the
+    # content guard never fires and parity vs the (unguarded) triton convert holds.
+    if num_pool_blocks is None:
+        num_pool_blocks = num_rows * num_blocks
 
     output = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
     valid_count = torch.empty((num_rows,), dtype=torch.int32, device="cuda")
@@ -90,6 +95,7 @@ def _run_case(
         top_k,
         max_len,
         block_size,
+        num_pool_blocks,
     )
     expected_output, expected_valid_count = triton_convert_req_index_to_global_index(
         req_id,
@@ -100,7 +106,18 @@ def _run_case(
         return_valid_counts=True,
     )
 
-    torch.testing.assert_close(output, expected_output, rtol=0, atol=0, msg=name)
+    # persistent_topk and the global kernel emit the same top-k SET in
+    # non-deterministic order (thread scheduling), and sparse attention is
+    # permutation-invariant over the selected set, so compare the two remapped
+    # results order-insensitively (per-row sort). valid_count below is already
+    # order-independent and pins down the exact count of selected slots.
+    torch.testing.assert_close(
+        output.sort(dim=1).values,
+        expected_output.sort(dim=1).values,
+        rtol=0,
+        atol=0,
+        msg=name,
+    )
     torch.testing.assert_close(
         valid_count,
         (output >= 0).sum(dim=1).to(torch.int32),
@@ -114,6 +131,36 @@ def _run_case(
         rtol=0,
         atol=0,
         msg=f"{name}: triton valid_count mismatch",
+    )
+
+
+def _run_garbage_content_case(*, top_k: int, block_size: int, num_rows: int = 40) -> None:
+    """block_table filled with OUT-OF-POOL garbage (-1 and a value far above the
+    pool). The content guard must map EVERY selected slot to -1 (valid_count 0) —
+    never an OOB KV-slot address. This is exactly the stale/freed-block class the
+    guard hardens against (defense-in-depth on the indexed-gather kernel)."""
+    assert num_rows > 32
+    max_len = top_k + 256
+    lengths = torch.full((num_rows,), max_len, dtype=torch.int32, device="cuda")
+    logits = _make_logits(lengths, max_len, sorted_asc=True)
+    req_id = torch.arange(num_rows, dtype=torch.int32, device="cuda")
+    num_blocks = math.ceil(max_len / block_size)
+    num_pool_blocks = num_rows * num_blocks
+    block_table = torch.full(
+        (num_rows, num_blocks), num_pool_blocks + 1_000_000, dtype=torch.int32, device="cuda"
+    )
+    block_table[:, ::2] = -1  # mix -1 and huge; both are out-of-pool garbage
+    output = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    valid_count = torch.empty((num_rows,), dtype=torch.int32, device="cuda")
+    torch.ops._C.persistent_topk_global(
+        logits, lengths, output, valid_count, block_table, req_id,
+        top_k, max_len, block_size, num_pool_blocks,
+    )
+    assert (output == -1).all(), f"garbage_k{top_k}: expected all -1 out (OOB guard)"
+    assert (valid_count == 0).all(), f"garbage_k{top_k}: expected valid_count 0"
+    torch.testing.assert_close(
+        valid_count, (output >= 0).sum(dim=1).to(torch.int32), rtol=0, atol=0,
+        msg=f"garbage_k{top_k}: valid_count vs output mismatch",
     )
 
 
@@ -158,6 +205,11 @@ def test_persistent_topk_global_valid_count_parity() -> None:
         sorted_asc=True,
     )
 
+    # Content-guard (defense-in-depth): stale/garbage block_table entries -> all
+    # -1, count 0 (never an OOB KV slot).
+    for top_k in (512, 1024, 2048):
+        _run_garbage_content_case(top_k=top_k, block_size=block_size)
+
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
 def test_persistent_buf_regrow_graph_safety() -> None:
@@ -180,6 +232,7 @@ def test_persistent_buf_regrow_graph_safety() -> None:
     dev = torch.device("cuda")
     num_rows, top_k, max_len, block_size = 48, 512, 768, 64
     num_blocks = max_len // block_size
+    num_pool_blocks = num_rows * num_blocks
 
     logits = torch.randn(num_rows, max_len, dtype=torch.float32, device=dev)
     lengths = torch.full((num_rows,), max_len, dtype=torch.int32, device=dev)
@@ -198,7 +251,7 @@ def test_persistent_buf_regrow_graph_safety() -> None:
     def run_fold():
         torch.ops._C.persistent_topk_global(
             logits, lengths, out, vc, block_table, req_id,
-            top_k, max_len, block_size,
+            top_k, max_len, block_size, num_pool_blocks,
         )
 
     s = torch.cuda.Stream()

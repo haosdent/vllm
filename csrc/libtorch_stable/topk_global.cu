@@ -17,7 +17,7 @@ void persistent_topk_global(const torch::stable::Tensor& logits,
                              const torch::stable::Tensor& block_table,
                              const torch::stable::Tensor& req_id,
                              int64_t k, int64_t max_seq_len,
-                             int64_t block_size) {
+                             int64_t block_size, int64_t num_pool_blocks) {
 #ifndef USE_ROCM
   STD_TORCH_CHECK(logits.is_cuda(), "logits must be CUDA tensor");
   STD_TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA tensor");
@@ -77,7 +77,8 @@ void persistent_topk_global(const torch::stable::Tensor& logits,
         static_cast<uint32_t>(k), static_cast<uint32_t>(max_len),
         block_table.const_data_ptr<int32_t>(), req_id.const_data_ptr<int32_t>(),
         static_cast<int>(bt_s0), static_cast<int>(bt_s1),
-        static_cast<int>(max_blocks), static_cast<int>(block_size), stream);
+        static_cast<int>(max_blocks), static_cast<int>(block_size),
+        static_cast<int>(num_pool_blocks), stream);
   } else if (k == 1024) {
     status = vllm::FilteredTopKGlobalRaggedTransform<float, int32_t, 1024>(
         logits.const_data_ptr<float>(), output.mutable_data_ptr<int32_t>(),
@@ -86,7 +87,8 @@ void persistent_topk_global(const torch::stable::Tensor& logits,
         static_cast<uint32_t>(k), static_cast<uint32_t>(max_len),
         block_table.const_data_ptr<int32_t>(), req_id.const_data_ptr<int32_t>(),
         static_cast<int>(bt_s0), static_cast<int>(bt_s1),
-        static_cast<int>(max_blocks), static_cast<int>(block_size), stream);
+        static_cast<int>(max_blocks), static_cast<int>(block_size),
+        static_cast<int>(num_pool_blocks), stream);
   } else {
     status = vllm::FilteredTopKGlobalRaggedTransform<float, int32_t, 2048>(
         logits.const_data_ptr<float>(), output.mutable_data_ptr<int32_t>(),
@@ -95,7 +97,8 @@ void persistent_topk_global(const torch::stable::Tensor& logits,
         static_cast<uint32_t>(k), static_cast<uint32_t>(max_len),
         block_table.const_data_ptr<int32_t>(), req_id.const_data_ptr<int32_t>(),
         static_cast<int>(bt_s0), static_cast<int>(bt_s1),
-        static_cast<int>(max_blocks), static_cast<int>(block_size), stream);
+        static_cast<int>(max_blocks), static_cast<int>(block_size),
+        static_cast<int>(num_pool_blocks), stream);
   }
   STD_TORCH_CHECK(status == cudaSuccess,
                   "FilteredTopKGlobal failed: ", cudaGetErrorString(status));

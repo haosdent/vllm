@@ -9,11 +9,17 @@ template <typename IdType>
 __device__ __forceinline__ IdType remap_global_index(int local, IdType req,
                                                        const IdType* block_table,
                                                        int bt_s0, int bt_s1,
-                                                       int max_blocks, int block_size) {
+                                                       int max_blocks, int block_size,
+                                                       int num_pool_blocks) {
   if (local < 0) return (IdType)-1;
   int block_id = local / block_size;
   if (block_id < 0 || block_id >= max_blocks) return (IdType)-1;
   IdType base = block_table[(int64_t)req * bt_s0 + (int64_t)block_id * bt_s1];
+  // Content guard: a stale/garbage block_table entry (padded rows / freed-block
+  // reuse under preemption churn) can point past the KV pool. Turn any such
+  // out-of-pool physical block into the benign -1 the downstream already
+  // handles, so it can never become an out-of-bounds KV-slot address.
+  if (base < (IdType)0 || base >= (IdType)num_pool_blocks) return (IdType)-1;
   return (IdType)(base * block_size + (local % block_size));
 }
 
@@ -34,7 +40,8 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
                               uint32_t max_len,
                               const IdType* __restrict__ block_table,
                               const IdType* __restrict__ req_id, int bt_s0,
-                              int bt_s1, int max_blocks, int block_size) {
+                              int bt_s1, int max_blocks, int block_size,
+                              int num_pool_blocks) {
   constexpr uint32_t BLOCK_SIZE = FILTERED_TOPK_BLOCK_THREADS;
   constexpr int RADIX = 256;
   constexpr int SMEM_INPUT_SIZE = FILTERED_TOPK_SMEM_INPUT_SIZE;
@@ -56,7 +63,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     if (tx == 0) s_valid = 0;
     __syncthreads();
     for (int i = tx; i < static_cast<int>(top_k); i += BLOCK_SIZE) {
-      const IdType mapped = (i < length) ? remap_global_index<IdType>(i, req, block_table, bt_s0, bt_s1, max_blocks, block_size) : (IdType)-1;
+      const IdType mapped = (i < length) ? remap_global_index<IdType>(i, req, block_table, bt_s0, bt_s1, max_blocks, block_size, num_pool_blocks) : (IdType)-1;
       dst[i] = mapped;
       if (mapped != (IdType)-1) atomicAdd(&s_valid, 1);
     }
@@ -269,7 +276,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
 #pragma unroll 2
   for (int base = tx; base < static_cast<int>(top_k); base += BLOCK_SIZE) {
     const int idx = s_indices[base];
-    const IdType mapped = remap_global_index<IdType>(idx, req, block_table, bt_s0, bt_s1, max_blocks, block_size);
+    const IdType mapped = remap_global_index<IdType>(idx, req, block_table, bt_s0, bt_s1, max_blocks, block_size, num_pool_blocks);
     dst[base] = mapped;
     if (mapped != (IdType)-1) atomicAdd(&s_valid, 1);
   }
@@ -287,7 +294,7 @@ cudaError_t FilteredTopKGlobalRaggedTransform(const DType* input,
                                               const IdType* block_table,
                                               const IdType* req_id, int bt_s0,
                                               int bt_s1, int max_blocks,
-                                              int block_size,
+                                              int block_size, int num_pool_blocks,
                                               cudaStream_t stream = 0) {
   constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
   constexpr int MAX_VEC = 16 / sizeof(DType);
@@ -298,7 +305,7 @@ cudaError_t FilteredTopKGlobalRaggedTransform(const DType* input,
                   &lengths,     &num_rows,       &top_k_val,
                   &max_len,     &block_table,    &req_id,
                   &bt_s0,       &bt_s1,          &max_blocks,
-                  &block_size};
+                  &block_size,  &num_pool_blocks};
 
   const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
 

@@ -409,6 +409,12 @@ def sparse_attn_indexer(
             # block_size == KV-cache block size == dim 1 of the kv-cache view;
             # req(t)=t for next_n==1 pure decode.
             block_size = kv_cache.shape[1]
+            # KV-pool block count. Defense-in-depth: the kernel maps any block_table
+            # entry that points past the pool (a stale/garbage physical block) to
+            # -1, so a bad loaded index can never become an out-of-bounds KV slot.
+            # This is hardening on a custom indexed-gather kernel, not the crash
+            # fix (the fold-decision channel is); it costs one compare per index.
+            num_pool_blocks = kv_cache.shape[0]
             # Persistent req_id (arange) + valid_count buffers — no per-call alloc
             # (the earlier torch.arange + downstream (topk>=0).sum was a ~1ms/step
             # in-graph-alloc regression). valid_count = persistent_topk_global's
@@ -425,6 +431,7 @@ def sparse_attn_indexer(
                 topk_tokens,
                 attn_metadata_narrowed.max_seq_len,
                 block_size,
+                num_pool_blocks,
             )
         elif (
             current_platform.is_cuda()
