@@ -36,6 +36,13 @@ if TYPE_CHECKING:
     # directly and the attention skips the separate triton convert on folded
     # decode steps (rows>32, pure-decode). Opt-in; other steps keep the convert.
     VLLM_GLM_TOPK_GLOBAL_FOLD: bool = False
+    # Two-stage K-side early-fork for the GLM-DSA v4 attention overlap. When set
+    # (requires VLLM_GLM_DSA_V4_ATTN=1), the indexer's K-side (wk_weights_proj
+    # GEMM + fused K norm/rope/quant/cache insert), which depends only on
+    # hidden_states, is launched on the aux stream at layer start so it overlaps
+    # fused_qkv_a_proj + q_a_norm on the main stream; the Q-side (wq_b + q rope/
+    # quant + logits + topk) runs after q_c is ready. Opt-in; off by default.
+    VLLM_GLM_DSA_KSIDE_FORK: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
@@ -718,6 +725,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM_TOPK_GLOBAL_FOLD": lambda: bool(
         int(os.getenv("VLLM_GLM_TOPK_GLOBAL_FOLD", "0"))
+    ),
+    "VLLM_GLM_DSA_KSIDE_FORK": lambda: bool(
+        int(os.getenv("VLLM_GLM_DSA_KSIDE_FORK", "0"))
     ),
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(

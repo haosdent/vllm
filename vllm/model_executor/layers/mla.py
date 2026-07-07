@@ -238,11 +238,28 @@ def _dsa_attn_overlap_prep_impl(
             )
         return q, kv_c_normed, k_pe_out
 
+    def _aux_indexer():
+        # K-side early-fork handoff (VLLM_GLM_DSA_KSIDE_FORK): when the
+        # Stage-1 op already ran wk_weights_proj + the fused K cache insert on
+        # this same aux stream (overlapping the fused_qkv_a window), finish
+        # with the Q-side only. Same-stream ordering makes the Stage-1 ->
+        # Stage-2 dependency free. Clear-after-read so a fallback step never
+        # consumes stale state (the mode-4 lesson).
+        if getattr(self, "_kside_forked", False):
+            self._kside_forked = False
+            weights_raw, k = self._kside_state
+            self._kside_state = None
+            return idx.qside_finish(
+                hidden_states, q_c, positions, self.indexer_rope_emb,
+                weights_raw, k,
+            )
+        return idx.forward_via_function(
+            hidden_states, q_c, positions, self.indexer_rope_emb
+        )
+
     (q, kv_c_normed, k_pe_out), _ = maybe_execute_in_parallel(
         _main,
-        lambda: idx.forward_via_function(
-            hidden_states, q_c, positions, self.indexer_rope_emb
-        ),
+        _aux_indexer,
         self._dsa_overlap_events[0],
         self._dsa_overlap_events[1],
         stream,
@@ -281,6 +298,104 @@ direct_register_custom_op(
     op_func=_dsa_attn_overlap_prep_impl,
     mutates_args=["hidden_states"],
     fake_impl=_dsa_attn_overlap_prep_fake,
+)
+
+
+# One-time aux-stream GEMM priming for the K-side fork: Stage-1 puts a NEW
+# cuBLAS GEMM on the aux stream whose first execution would otherwise happen
+# inside cudagraph capture, where a lazy workspace allocation is illegal. The
+# Stage-1 op primes on its first EAGER call (warmup passes run before any
+# capture, with weights loaded), so capture never sees a first-use alloc.
+_kside_aux_primed = False
+# One-time capture-engagement markers (runtime proof the fork actually baked
+# into a graph of each size — the lever-A "verify which code executes" lesson).
+_kside_baked_sizes: set[int] = set()
+
+
+def _dsa_kside_prime_aux(idx, kw_buf: torch.Tensor) -> None:
+    global _kside_aux_primed
+    if _kside_aux_primed:
+        return
+    _kside_aux_primed = True
+    w = idx.wk_weights_proj.weight
+    dummy = kw_buf.new_zeros((min(32, kw_buf.shape[0]), w.shape[1]))
+    stream = aux_stream()
+    with torch.cuda.stream(stream):
+        torch.mm(dummy, w.t(), out=kw_buf[: dummy.shape[0]])
+    torch.cuda.current_stream().wait_stream(stream)
+
+
+def _dsa_kside_fork_impl(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    prefix: str,
+) -> None:
+    """Stage-1 of the K-side early-fork (VLLM_GLM_DSA_KSIDE_FORK): launch the
+    indexer's hidden_states-only work (wk_weights_proj GEMM + fused K
+    norm/rope/quant/cache insert) on the aux stream at LAYER START, so it
+    overlaps the fused_qkv_a_proj + q_a_layernorm window on the main stream
+    (measured 14.5us/layer at c64 vs 12.1us of movable K-side work). The prep
+    op's aux chain (Stage-2) runs on the SAME aux stream, so it is ordered
+    after Stage-1 for free, and its join event covers Stage-1's work — no join
+    here (fork-only is capture-legal because Stage-2 always rejoins).
+
+    Contract (the campaign's four laws):
+    - fork ONLY inside cudagraph capture (eager forks raced on uncaptured
+      shapes); eager/mixed steps return immediately and Stage-2 runs the full
+      indexer chain exactly as the certified path does;
+    - registered as a splitting op (compilation.py _attention_ops);
+    - outputs live in a per-layer PERSISTENT buffer (kw_out), so the held
+      (weights_raw, k) views are address-stable and the aux stream performs
+      ZERO graph-pool allocation concurrent with the main stream's captured
+      window (the 4a allocation lesson);
+    - the handoff flag is set from kside_fork's ACTUAL insert decision and
+      cleared-after-read by Stage-2 (the lever-A single-source-of-truth
+      lesson), so a graph can never bake skip_k_cache_insert=True without the
+      matching insert baked in Stage-1;
+    - batch gate: engages only for >=32 rows (batch-1 keeps the certified
+      path; the extra fork/event overhead regressed c1)."""
+    self = get_forward_context().no_compile_layers[prefix]
+    idx = self.indexer
+    self._kside_forked = False
+    capturing = torch.cuda.is_current_stream_capturing()
+    n = hidden_states.shape[0]
+    if not capturing:
+        _dsa_kside_prime_aux(idx, self._kside_kw_buf)
+        return
+    if n < 32 or n > self._kside_buf_tokens:
+        return
+    ev = self._kside_fork_event
+    ev.record()
+    stream = aux_stream()
+    with torch.cuda.stream(stream):
+        ev.wait()
+        weights_raw, k, inserted = idx.kside_fork(
+            hidden_states,
+            positions,
+            self.indexer_rope_emb,
+            kw_out=self._kside_kw_buf,
+        )
+    if inserted:
+        self._kside_state = (weights_raw, k)
+        self._kside_forked = True
+        if n not in _kside_baked_sizes:
+            _kside_baked_sizes.add(n)
+            print(f"[KSIDE] fork baked into capture n={n}", flush=True)
+
+
+def _dsa_kside_fork_fake(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    prefix: str,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="dsa_kside_fork",
+    op_func=_dsa_kside_fork_impl,
+    mutates_args=["hidden_states"],
+    fake_impl=_dsa_kside_fork_fake,
 )
 
 
@@ -458,6 +573,31 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 raise ValueError(f"Duplicate layer name: {prefix}")
             static_fwd_ctx[prefix] = self
 
+        # K-side early-fork (VLLM_GLM_DSA_KSIDE_FORK): Stage-1 op launches the
+        # indexer's hidden_states-only work on the aux stream BEFORE
+        # fused_qkv_a_proj (see _dsa_kside_fork_impl); the prep op's aux chain
+        # becomes Q-side-only via the _kside_forked handoff. Requires the prep
+        # overlap (Stage-2 lives in its aux lambda) + the fused-K kernel path.
+        self._kside_forked = False
+        self._kside_state = None
+        self.use_glm_kside_fork = (
+            envs.VLLM_GLM_DSA_KSIDE_FORK
+            and self.use_glm_attn_prep_overlap
+            and getattr(self.indexer, "use_fused_indexer_k", False)
+        )
+        if self.use_glm_kside_fork:
+            self._kside_fork_event = torch.cuda.Event()
+            self._kside_buf_tokens = self._dsa_out_buf_tokens
+            wk_w = self.indexer.wk_weights_proj.weight
+            # Persistent kw scratch (law: address-stable outputs + zero aux
+            # graph-pool allocation): rows = max capture size, cols = the
+            # fused wk+weights out dim (head_dim + n_heads).
+            self._kside_kw_buf = torch.empty(
+                (max(self._kside_buf_tokens, 32), wk_w.shape[0]),
+                dtype=wk_w.dtype,
+                device=current_platform.device_type,
+            )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -479,6 +619,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 "q_b_proj is required when q_lora_rank is not None"
             )
 
+            if self.use_glm_kside_fork:
+                # Stage-1 of the K-side early-fork: put the indexer's
+                # hidden_states-only work on the aux stream NOW, overlapping
+                # the fused_qkv_a_proj + q_a_layernorm window below.
+                torch.ops.vllm.dsa_kside_fork(
+                    hidden_states, positions, self.prefix
+                )
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],

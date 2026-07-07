@@ -777,6 +777,7 @@ class CompilationConfig:
         # the captured q_b_proj||indexer overlap is unaffected.
         "vllm::dsa_attn_overlap",
         "vllm::dsa_attn_overlap_prep",
+        "vllm::dsa_kside_fork",
     ]
 
     def compute_hash(self) -> str:
