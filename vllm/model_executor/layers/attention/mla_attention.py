@@ -533,6 +533,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # Mode-4a: hoist ONLY the bmm; concat+quant stay eager in forward_impl.
         # _mqa_ql_nope_buf holds the persistent bmm output (N, B, L flat).
         self.mqa_bmm_only = False
+        # Write/read handshake for the hoisted mqa buffer. The overlap op writes
+        # at the step's PADDED token count (piecewise/graph padding) while
+        # forward_impl reads at the ACTUAL count after the attention op narrows
+        # its inputs — with the flat (N, B, L) layout a B mismatch skews every
+        # head > 0 (proven: B_w=40/B_r=33 gave head-0 diff 0, heads 1/8/15 diff
+        # ~85 => the cache-hit context-blindness). The write records B; the read
+        # consumes-and-invalidates and falls back to the inline compute when the
+        # counts differ. Same-thread, same-forward (write and read are
+        # microseconds apart in one layer), so no async-scheduling hazard;
+        # captured pure-decode has B_w == B_r == graph size, baking the
+        # always-true branch — the decode hot path is unchanged.
+        self._mqa_bmm_written_tokens: int | None = None
         self._mqa_ql_nope_buf: torch.Tensor | None = None
 
     @property
@@ -690,6 +702,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         out = self._mqa_ql_nope_buf[: N * B * L].view(N, B, L)
         # (N, B, P) x (N, P, L) -> (N, B, L), into the persistent buffer.
         torch.bmm(mqa_q_nope, self.W_UK_T, out=out)
+        # Handshake with the forward_impl read (see _mqa_bmm_written_tokens).
+        self._mqa_bmm_written_tokens = B
 
     def _finish_mqa_from_precomputed_bmm(
         self, mqa_q: torch.Tensor, fp8_attention: bool, B: int
@@ -926,10 +940,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # mode 4 (VLLM_GLM_ATTN_PREP_OVERLAP=4) hoists this into the DSA
             # attn-prep overlap op, which writes it into the PERSISTENT mqa
             # buffer; read that same buffer here (stable address, no clear).
-            # The capacity gate keeps eager prefill (tokens > capture size) on
-            # the inline path. Default path (use_precomputed_mqa False) is
-            # byte-identical.
-            if self.use_precomputed_mqa and num_mqa_tokens <= self.mqa_buf_capacity:
+            # Handshake gate: the hoist writes at the PADDED token count and
+            # this read runs at the ACTUAL count; a mismatch skews the flat
+            # (N, B, L) layout for every head > 0, so consume the recorded
+            # write count (invalidating it either way — a stale value must
+            # never survive the step) and only take the hoisted path when it
+            # matches. Captured pure-decode always matches (both = graph size).
+            # Default path (use_precomputed_mqa False) is byte-identical.
+            mqa_written = self._mqa_bmm_written_tokens
+            self._mqa_bmm_written_tokens = None
+            if self.use_precomputed_mqa and mqa_written == num_mqa_tokens:
                 if self.mqa_bmm_only:
                     # 4a: bmm precomputed in the buffer; run split-pe + concat +
                     # fp8 quant EAGERLY here (quant stays off the aux overlap).

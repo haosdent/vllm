@@ -19,6 +19,62 @@ from vllm.utils.torch_utils import (
 )
 
 
+# Persistent output buffers for the overlap ops when they run OUTSIDE cudagraph
+# capture (eager mixed steps / piecewise-split contexts). The overlap ops are
+# splitting ops, and piecewise cudagraph pieces bake their input ADDRESSES at
+# capture (CUDAGraphWrapper copies nothing; addresses are only checked under
+# VLLM_LOGGING_LEVEL=DEBUG) — so a splitting op feeding a replayed piece must
+# return address-stable tensors, like sparse_attn_indexer's persistent topk
+# buffer. Returning fresh allocations here made every <=max-capture-size mixed
+# step (prefix-cache-hit tail chunks) feed stale capture-time addresses into
+# the downstream piece (GSM8K cache-hit repeat 0.15 vs ~0.95). Inside FULL
+# capture fresh tensors are graph-internal and fine — skipping the copy there
+# keeps the decode hot path unchanged. Sized to the max capture size: larger
+# eager steps run their pieces eagerly too, so fresh outputs are safe.
+_dsa_overlap_out_bufs: dict[torch.device, tuple[torch.Tensor, ...]] = {}
+
+
+def _dsa_overlap_stabilize(
+    self,
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor | None = None,
+    k_pe: torch.Tensor | None = None,
+):
+    """Copy overlap-op outputs into persistent per-device buffers and return
+    address-stable slices (see _dsa_overlap_out_bufs). Falls back to the fresh
+    tensors when the step exceeds the piecewise-replayable size."""
+    n = q.shape[0]
+    cap = self._dsa_out_buf_tokens
+    if n == 0 or n > cap:
+        return q, kv_c_normed, k_pe
+    dev = q.device
+    bufs = _dsa_overlap_out_bufs.get(dev)
+    if bufs is None:
+        # q is stored flat per token: the base op returns 2D [n, H*D], the
+        # prep op 3D [n, H, D] — same storage, viewed per call.
+        bufs = (
+            torch.empty((cap, q[0].numel()), dtype=q.dtype, device=dev),
+            torch.empty(
+                (cap, self.kv_lora_rank), dtype=q.dtype, device=dev
+            ),
+            torch.empty(
+                (cap, 1, self.qk_rope_head_dim), dtype=q.dtype, device=dev
+            ),
+        )
+        _dsa_overlap_out_bufs[dev] = bufs
+    q_out = bufs[0][:n].view(q.shape)
+    q_out.copy_(q)
+    kv_out = None
+    if kv_c_normed is not None:
+        kv_out = bufs[1][:n]
+        kv_out.copy_(kv_c_normed)
+    kpe_out = None
+    if k_pe is not None:
+        kpe_out = bufs[2][:n]
+        kpe_out.copy_(k_pe)
+    return q_out, kv_out, kpe_out
+
+
 def _dsa_attn_overlap_impl(
     hidden_states: torch.Tensor,
     q_c: torch.Tensor,
@@ -34,7 +90,16 @@ def _dsa_attn_overlap_impl(
     cudagraph, no eager-break, no un-capture penalty)."""
     self = get_forward_context().no_compile_layers[prefix]
     idx = self.indexer
-    stream = aux_stream()
+    # Fork ONLY inside cudagraph capture: capture bakes the fork/join edges into
+    # the graph, so replays are race-free (validated by every decode eval).
+    # EAGER executions (mixed prefill steps / uncaptured shapes — e.g. the tiny
+    # tail chunks of prefix-cache-hit prompts) raced and produced garbage first
+    # tokens (GSM8K cache-hit repeat 0.005-0.59 vs 0.94 with the fork off;
+    # bis1/bis2 attribution serves, 2026-07-07). Eager steps are
+    # prefill-dominated, so the overlap gains nothing there — run sequentially
+    # (maybe_execute_in_parallel with aux_stream=None).
+    capturing = torch.cuda.is_current_stream_capturing()
+    stream = aux_stream() if capturing else None
     q, _ = maybe_execute_in_parallel(
         lambda: self.q_b_proj(q_c)[0],
         lambda: idx.forward_via_function(
@@ -44,6 +109,11 @@ def _dsa_attn_overlap_impl(
         self._dsa_overlap_events[1],
         stream,
     )
+    if not capturing:
+        # Address-stable output for the downstream piecewise piece; see
+        # _dsa_overlap_out_bufs. FULL-capture returns stay fresh (graph-
+        # internal), keeping the decode hot path copy-free.
+        q, _, _ = _dsa_overlap_stabilize(self, q)
     return q
 
 
@@ -92,7 +162,10 @@ def _dsa_attn_overlap_prep_impl(
     fc = get_forward_context()
     self = fc.no_compile_layers[prefix]
     idx = self.indexer
-    stream = aux_stream()
+    # Fork only under capture — see _dsa_attn_overlap_impl (the eager fork
+    # raced on uncaptured shapes; sequential there, overlap kept in graphs).
+    capturing = torch.cuda.is_current_stream_capturing()
+    stream = aux_stream() if capturing else None
 
     def _main() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q = self.q_b_proj(q_c)[0].view(-1, num_heads, qk_head_dim)
@@ -179,6 +252,13 @@ def _dsa_attn_overlap_prep_impl(
         self._dsa_overlap_events[1],
         stream,
     )
+    if not capturing:
+        # Address-stable outputs for the downstream piecewise piece; see
+        # _dsa_overlap_out_bufs. FULL-capture returns stay fresh (graph-
+        # internal), keeping the decode hot path copy-free.
+        q, kv_c_normed, k_pe_out = _dsa_overlap_stabilize(
+            self, q, kv_c_normed, k_pe_out
+        )
     return q, kv_c_normed, k_pe_out
 
 
@@ -365,6 +445,16 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
         if self.use_glm_dsa_v4:
             self._dsa_overlap_events = [torch.cuda.Event(), torch.cuda.Event()]
+            # Pre-create the global aux stream now: the fork only engages inside
+            # cudagraph capture, and lazily creating a CUDA stream mid-capture
+            # is illegal.
+            aux_stream()
+            # Piecewise-replayable steps never exceed the max capture size;
+            # larger eager steps keep fresh outputs (see _dsa_overlap_stabilize).
+            self._dsa_out_buf_tokens = (
+                get_current_vllm_config().compilation_config.max_cudagraph_capture_size
+                or 0
+            )
             static_fwd_ctx = (
                 get_current_vllm_config().compilation_config.static_forward_context
             )
