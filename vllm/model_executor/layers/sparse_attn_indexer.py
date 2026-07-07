@@ -24,7 +24,10 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.mla.indexer import (
+    _DSA_FOLD_FC_KEY,
     DeepseekV32IndexerMetadata,
+    dsa_get_persistent_bufs,
+    should_fold_topk_global,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -76,6 +79,11 @@ def kv_cache_as_quant_view(
             stride=(page_bytes, fp4_bytes, fp4_bytes, 1),
         )
     return kv_cache.unsqueeze(-2)
+
+
+# persistent_topk needs >= this many decode rows to amortize its launch
+# overhead (see the routing comment in the decode branch below).
+_PERSISTENT_TOPK_MIN_ROWS = 9
 
 
 @eager_break_during_capture
@@ -204,7 +212,11 @@ def sparse_attn_indexer(
                 scale_fmt,
             )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # The top_k_per_row decode kernel fully writes [:rows, :topk] including
+    # -1 padding for short rows, so the pre-fill is only needed for prefill
+    # chunks and the persistent_topk path (which does not self-pad).
+    if has_prefill or num_decode_tokens >= _PERSISTENT_TOPK_MIN_ROWS:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -366,7 +378,59 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):
+        # persistent_topk's worst-case-sized launch (1024 threads, large smem
+        # carveout, RadixRowState memset) stalls ~9us per layer in the decode
+        # cudagraph. At small decode batches that per-launch stall dominates
+        # per-token cost (~6% TPOT at batch 1), so route them to the light
+        # per-row kernel; persistent_topk stays for larger batches where its
+        # throughput wins. num_rows is capture-time static per cudagraph, so
+        # this branch is graph-safe.
+        # Lever A: fold the block-table local->global remap into the top-k
+        # write (persistent_topk_global) for the FilteredTopK regime (rows>32),
+        # so the attention skips the separate triton convert. Only for
+        # pure-decode-non-spec steps (next_n==1, no prefill, no padding); other
+        # cases keep persistent_topk + the downstream convert. Gate lives in one
+        # place (should_fold_topk_global) so this site and the attention read can
+        # never drift.
+        fold_global = should_fold_topk_global(
+            topk_tokens=topk_tokens,
+            num_rows=num_rows,
+            next_n=next_n,
+            requires_padding=decode_metadata.requires_padding,
+            has_prefill=has_prefill,
+        )
+        # Publish this step's ACTUAL fold decision so the attention keys off the
+        # indexer's real choice. forward_context is per-step (rebuilt every step,
+        # so nothing stale) and the write is unconditional (overwrites any prior
+        # value); the attention treats an absent key as False (convert runs). All
+        # DSA layers in a step share one decision, so a single bool suffices.
+        get_forward_context().additional_kwargs[_DSA_FOLD_FC_KEY] = fold_global
+        if fold_global:
+            # block_size == KV-cache block size == dim 1 of the kv-cache view;
+            # req(t)=t for next_n==1 pure decode.
+            block_size = kv_cache.shape[1]
+            # Persistent req_id (arange) + valid_count buffers — no per-call alloc
+            # (the earlier torch.arange + downstream (topk>=0).sum was a ~1ms/step
+            # in-graph-alloc regression). valid_count = persistent_topk_global's
+            # second output (count of non-(-1) global slots per row); the attention
+            # reads it as seq_lens, skipping the ~292us convert.
+            req_id, valid_count = dsa_get_persistent_bufs(logits.device, num_rows)
+            torch.ops._C.persistent_topk_global(
+                logits,
+                seq_lens,
+                topk_indices,
+                valid_count,
+                decode_metadata.block_table,
+                req_id,
+                topk_tokens,
+                attn_metadata_narrowed.max_seq_len,
+                block_size,
+            )
+        elif (
+            current_platform.is_cuda()
+            and topk_tokens in (512, 1024, 2048)
+            and num_rows >= _PERSISTENT_TOPK_MIN_ROWS
+        ):
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),

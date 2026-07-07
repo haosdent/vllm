@@ -31,6 +31,11 @@ if TYPE_CHECKING:
     VLLM_GLM_DSA_V4_ATTN: bool = False
     VLLM_GLM_ATTN_PREP_OVERLAP: int = 0
     VLLM_GLM_ATTN_PREP_MQA_BMM_ONLY: bool = False
+    # Lever A: fold the block-table local->global remap into the DSA indexer's
+    # top-k kernel (persistent_topk_global) so it emits global KV-slot indices
+    # directly and the attention skips the separate triton convert on folded
+    # decode steps (rows>32, pure-decode). Opt-in; other steps keep the convert.
+    VLLM_GLM_TOPK_GLOBAL_FOLD: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
@@ -710,6 +715,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM_ATTN_PREP_MQA_BMM_ONLY": lambda: bool(
         int(os.getenv("VLLM_GLM_ATTN_PREP_MQA_BMM_ONLY", "0"))
+    ),
+    "VLLM_GLM_TOPK_GLOBAL_FOLD": lambda: bool(
+        int(os.getenv("VLLM_GLM_TOPK_GLOBAL_FOLD", "0"))
     ),
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(

@@ -31,6 +31,96 @@ from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
 
+# Lever A (VLLM_GLM_TOPK_GLOBAL_FOLD): the DSA indexer can fold the block-table
+# local->global remap into its top-k kernel, so the attention backend
+# (flashmla_sparse) skips the separate convert and reads the top-k indices as
+# already-global slots. The fold decision is a pure function of per-step inputs;
+# should_fold_topk_global below is the SINGLE place the gate expression lives.
+# The indexer is the authoritative site (it holds the exact inputs): it evaluates
+# the gate and PUBLISHES the resulting bool on the per-step forward_context
+# (additional_kwargs[_DSA_FOLD_FC_KEY]); the attention reads that one bool.
+#
+# This replaces an earlier persistent dict keyed by num_rows. That design had two
+# defects that together caused an out-of-bounds gather: the write key (indexer
+# num_rows, padded decode batch) and the read key (attention num_actual_toks)
+# diverge on mixed/padded steps, and the dict PERSISTED across steps — so a later
+# non-folded step could read a stale True left by an earlier folded step and feed
+# LOCAL (unremapped) indices into the KV gather. forward_context is rebuilt every
+# step (no cross-step staleness) and carries one authoritative decision (no key,
+# no dual-metadata recompute drift). Per-process, per-step.
+_DSA_FOLD_FC_KEY = "dsa_fold_topk_global"
+
+
+def should_fold_topk_global(
+    *,
+    topk_tokens: int,
+    num_rows: int,
+    next_n: int,
+    requires_padding: bool,
+    has_prefill: bool,
+) -> bool:
+    """Single source of truth for the Lever-A fold gate — a pure function of
+    per-step inputs. Called only by the DSA indexer (the authoritative site); the
+    attention consumes the published result and never re-evaluates this, so the
+    two sites can never drift. Fold only for pure-decode, non-spec, unpadded,
+    FilteredTopK-regime steps."""
+    return (
+        bool(envs.VLLM_GLM_TOPK_GLOBAL_FOLD)
+        and current_platform.is_cuda()
+        and topk_tokens in (512, 1024, 2048)
+        and num_rows > 32
+        and next_n == 1
+        and not requires_padding
+        and not has_prefill
+    )
+
+# Lever-A-prime persistent buffers (per device), to avoid per-layer-per-step
+# in-graph allocation on the fold path (the regression: torch.arange req_id +
+# the (topk>=0).sum output). _dsa_req_id_buf is a persistent arange (req(t)=t for
+# pure decode); _dsa_valid_count_buf receives persistent_topk_global's valid-count
+# second output, which the attention reads as seq_lens (skip the ~292us convert).
+# Sized to the max seen (grows only on eager paths; captured decode <= max
+# cudagraph size). The first fold call happens during the eager warmup, so the
+# allocation lands OUTSIDE cudagraph capture (stable address baked into replay).
+_dsa_req_id_buf: dict[torch.device, torch.Tensor] = {}
+_dsa_valid_count_buf: dict[torch.device, torch.Tensor] = {}
+# Retired generations of the two buffers above, kept alive FOREVER. FULL decode
+# cudagraphs bake the buffer ADDRESSES into the captured kernels (the fold
+# kernel's req_id read + valid_count write, and the captured attention's
+# seq_lens read of the same valid_count). When an eager step with more rows than
+# the current capacity regrows the buffers, freeing the old ones would hand
+# their memory back to the allocator, and every later FULL-graph replay would
+# read/write reused memory: garbage req_id -> out-of-bounds block_table gather
+# inside persistent_topk_global -> the GSM8K->512-running illegal-memory-access
+# (reproduced offline in csrc/libtorch_stable/parity_topk_global.py). A retained
+# retired buffer keeps every replay self-consistent instead. Cost: a few KB per
+# regrowth, and the pow-2 sizing below caps regrowths at O(log(max_num_seqs)).
+# The metadata builder presizes to the true row bound at init, so regrowth (and
+# retirement) should never actually trigger; this list is the backstop.
+#
+# INVARIANT (do not break): a replayed graph keeps using its RETIRED generation,
+# which is only correct because (a) req_id content is position-only (a static
+# arange -- old_buf[:N] == new_buf[:N] for any N within capacity) and (b)
+# valid_count is written and then read within the SAME replay. If req_id content
+# ever becomes step-dependent, or valid_count gains a cross-step reader, retired
+# generations go stale and this resurrects the illegal-access crash class.
+_dsa_retired_bufs: list[torch.Tensor] = []
+
+
+def dsa_get_persistent_bufs(device: torch.device, num_rows: int):
+    """Return (req_id[:num_rows], valid_count[:num_rows]) persistent-buffer views
+    for the lever-A-prime fold path. See _dsa_req_id_buf / _dsa_valid_count_buf."""
+    buf = _dsa_req_id_buf.get(device)
+    if buf is None or buf.numel() < num_rows:
+        n = max(512, 1 << (num_rows - 1).bit_length())
+        if buf is not None:
+            # Never free a generation that captured graphs may point at.
+            _dsa_retired_bufs.append(buf)
+            _dsa_retired_bufs.append(_dsa_valid_count_buf[device])
+        _dsa_req_id_buf[device] = torch.arange(n, dtype=torch.int32, device=device)
+        _dsa_valid_count_buf[device] = torch.empty(n, dtype=torch.int32, device=device)
+    return _dsa_req_id_buf[device][:num_rows], _dsa_valid_count_buf[device][:num_rows]
+
 
 @triton.jit
 def _prepare_uniform_decode_kernel(
@@ -276,6 +366,19 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             self.use_fp4_indexer_cache
             or not current_platform.is_device_capability_family(100)
         ) and next_n not in self.natively_supported_next_n_fp4
+
+        # Lever-A-prime: presize the fold-path persistent buffers to the true
+        # decode-row bound (max_num_seqs * next_n, or the largest FULL-graph
+        # capture size if bigger) so runtime regrowth -- and thus buffer
+        # retirement -- can never trigger. dsa_get_persistent_bufs keeps retired
+        # generations alive as the backstop; see _dsa_retired_bufs.
+        max_capture = max(
+            self.vllm_config.compilation_config.cudagraph_capture_sizes or [0]
+        )
+        dsa_get_persistent_bufs(
+            self.device,
+            max(scheduler_config.max_num_seqs * next_n, max_capture),
+        )
 
         sm_count = num_compute_units(self.device.index)
         self.num_sms = sm_count

@@ -21,6 +21,7 @@ from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     get_mla_dims,
@@ -37,6 +38,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
     SparseMLAAttentionImpl,
+)
+from vllm.v1.attention.backends.mla.indexer import (
+    _DSA_FOLD_FC_KEY,
+    _dsa_valid_count_buf,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
@@ -327,14 +332,39 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token[:num_actual_toks],
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-            return_valid_counts=True,
+        # Lever-A-prime: when the DSA indexer folded the block-table remap into
+        # its top-k this step, topk_indices are ALREADY global slots — skip the
+        # ~292us/step convert and derive seq_lens (valid counts) cheaply.
+        # persistent_topk_global applies the same OOB->-1 guard in-kernel, so
+        # (topk_indices>=0).sum(1) matches the convert's return_valid_counts
+        # (asserted in the serve-free repro). Non-folded steps (prefill /
+        # small-batch <=32) keep the convert and stay correct.
+        #
+        # The indexer publishes its ACTUAL per-step fold decision on the per-step
+        # forward_context; read that one bool. An absent key means the indexer did
+        # not fold this step (or did not run) -> default False -> convert runs,
+        # which is always correct. This can never disagree with whether the fold
+        # kernel actually produced global indices (see should_fold_topk_global).
+        fold_decision = get_forward_context().additional_kwargs.get(
+            _DSA_FOLD_FC_KEY, False
         )
+        vc = _dsa_valid_count_buf.get(topk_indices.device)
+        if fold_decision and vc is not None:
+            # Indexer folded the remap into its top-k: topk_indices are already
+            # global slots, and persistent_topk_global wrote per-row valid-counts
+            # into the persistent buffer this step — read them as seq_lens (no
+            # convert, no per-call alloc).
+            topk_indices_physical = topk_indices
+            seq_lens = vc[:num_actual_toks]
+        else:
+            topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=True,
+            )
 
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(q.device)

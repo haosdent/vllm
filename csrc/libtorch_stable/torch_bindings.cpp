@@ -402,6 +402,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "persistent_topk(Tensor logits, Tensor lengths, Tensor! output, "
       "Tensor workspace, int k, int max_seq_len) -> ()");
+  ops.def(
+      "persistent_topk_global(Tensor logits, Tensor lengths, Tensor! output, Tensor! valid_count, Tensor block_table, Tensor req_id, int k, int max_seq_len, int block_size) -> ()");
 
   // Activation ops
   // Activation function used in SwiGLU.
@@ -636,6 +638,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("top_k_per_row_prefill", TORCH_BOX(&top_k_per_row_prefill));
   ops.impl("top_k_per_row_decode", TORCH_BOX(&top_k_per_row_decode));
   ops.impl("persistent_topk", TORCH_BOX(&persistent_topk));
+  ops.impl("persistent_topk_global", TORCH_BOX(&persistent_topk_global));
 
   // Activation kernels (shared CUDA/ROCm)
   ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));
