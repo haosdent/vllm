@@ -143,7 +143,6 @@ def _dsa_attn_overlap_prep_impl(
     kv_lora: torch.Tensor,
     positions: torch.Tensor,
     prefix: str,
-    q_out_dim: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     qk_nope_head_dim: int,
@@ -169,7 +168,7 @@ def _dsa_attn_overlap_prep_impl(
 
     def _main() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q = self.q_b_proj(q_c)[0].view(-1, num_heads, qk_head_dim)
-        if self.attn_prep_mode in (2, 3, 4):
+        if self.attn_prep_mode >= 2:
             # ONE fused Triton kernel (split + kv_a_layernorm + interleaved
             # rope), fusion-parity with the baseline inductor kernel. Call the
             # PLAIN function, NOT the registered op, to avoid nesting custom
@@ -190,7 +189,7 @@ def _dsa_attn_overlap_prep_impl(
                 qk_rope_head_dim,
                 kv_lora_rank,
             )
-            if self.attn_prep_mode in (3, 4):
+            if self.attn_prep_mode >= 3:
                 # Hoist the topk-INDEPENDENT KV-cache write into the overlap so
                 # it runs concurrent with the indexer instead of serialized
                 # after it (MLAAttention skips its own write via
@@ -213,22 +212,18 @@ def _dsa_attn_overlap_prep_impl(
                     and slot_mapping is not None
                     and q.shape[0] <= attn.mqa_buf_capacity
                 ):
-                    # Also hoist the topk-INDEPENDENT query prep (W_UK absorb
-                    # bmm + fp8 quant) into the overlap, writing directly into
-                    # the attn layer's PERSISTENT mqa buffer via PRE-ALLOCATED
-                    # scratch — zero graph-pool allocation on the main stream, so
-                    # nothing allocates concurrently with the aux-stream indexer
-                    # during capture (that concurrent main+aux pool allocation
-                    # aliased a live tensor and corrupted output). forward_impl
-                    # reads the same buffer across the eager-break. Gate on
-                    # slot_mapping (present in every real capture incl. PIECEWISE,
-                    # absent in the profile run), matching the KV-write above.
-                    # Skipped when tokens exceed the buffer (eager prefill
-                    # recomputes inline in forward_impl).
-                    if attn.mqa_bmm_only:
-                        # 4a: hoist ONLY the bmm; concat+quant stay eager in
-                        # forward_impl (isolates the shared-cuBLAS-workspace bmm).
-                        attn.precompute_mqa_bmm_into_buffer(q)
+                    # 4a: hoist the topk-INDEPENDENT W_UK-absorb bmm into the
+                    # overlap, writing directly into the attn layer's PERSISTENT
+                    # mqa buffer — zero graph-pool allocation on the main stream,
+                    # so nothing allocates concurrently with the aux-stream
+                    # indexer during capture (that concurrent main+aux pool
+                    # allocation aliased a live tensor and corrupted output).
+                    # concat+quant stay eager in forward_impl, which reads the
+                    # buffer across the eager-break. Gate on slot_mapping (present
+                    # in every real capture incl. PIECEWISE, absent in the profile
+                    # run), matching the KV-write above. Skipped when tokens
+                    # exceed the buffer (eager prefill recomputes inline).
+                    attn.precompute_mqa_bmm_into_buffer(q)
             return q, kv_c_normed, k_pe_out
         # mode 1: EAGER prep (kept for A/B; regresses due to inductor-fusion
         # loss). Fresh k_pe copy: the in-place rope must not mutate/alias the
@@ -268,7 +263,6 @@ def _dsa_attn_overlap_prep_fake(
     kv_lora: torch.Tensor,
     positions: torch.Tensor,
     prefix: str,
-    q_out_dim: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     qk_nope_head_dim: int,
@@ -416,12 +410,14 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # mode 1 = EAGER prep (loses inductor fusion, regresses); mode 2 = one
         # fused_mla_split_rmsnorm_rope Triton kernel (fusion-parity, intended);
         # mode 3 = mode 2 + hoist the topk-independent KV-cache write into the
-        # overlap (fills more of the indexer stall).
+        # overlap (fills more of the indexer stall); mode 4 = mode 3 + hoist the
+        # topk-independent decode-mqa W_UK-absorb bmm (requires
+        # VLLM_GLM_ATTN_PREP_MQA_BMM_ONLY=1, "4a"; without it mode 4 == mode 3).
         # Supersedes decode-overlap; off (0) => PR#6 path unchanged.
         self.attn_prep_mode = (
             int(envs.VLLM_GLM_ATTN_PREP_OVERLAP) if self.use_glm_dsa_v4 else 0
         )
-        if self.attn_prep_mode in (2, 3, 4):
+        if self.attn_prep_mode >= 2:
             # The fused kernel is specific to GLM's interleaved DeepseekScaling
             # rope (is_neox_style=False, rotary_dim == qk_rope_head_dim); fall
             # back to eager prep if that gate is not met.
@@ -434,12 +430,12 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             if not fused_ok:
                 self.attn_prep_mode = 1
-        self.use_glm_attn_prep_overlap = self.attn_prep_mode in (1, 2, 3, 4)
+        self.use_glm_attn_prep_overlap = self.attn_prep_mode >= 1
         if self.attn_prep_mode == 4:
-            # Allocate the persistent decode-mqa buffer the prep op writes and
-            # forward_impl reads across the eager-break (mode 4 only). bmm_only
-            # (4a) allocates the smaller bmm-output buffer and leaves concat+quant
-            # eager in forward_impl.
+            # 4a (VLLM_GLM_ATTN_PREP_MQA_BMM_ONLY=1): allocate the persistent
+            # bmm-output buffer the prep op writes and forward_impl reads across
+            # the eager-break. Without the flag the hoist stays off (setup is a
+            # no-op) and mode 4 behaves as mode 3.
             self.mla_attn.setup_precomputed_mqa(
                 bmm_only=envs.VLLM_GLM_ATTN_PREP_MQA_BMM_ONLY
             )
@@ -501,7 +497,6 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                     kv_lora,
                     positions,
                     self.prefix,
-                    self.num_heads * self.qk_head_dim,
                     self.kv_lora_rank,
                     self.qk_rope_head_dim,
                     self.qk_nope_head_dim,
@@ -567,7 +562,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             # mode 3 already wrote the KV cache inside the overlap op.
-            skip_kv_cache_update=(self.attn_prep_mode in (3, 4)),
+            skip_kv_cache_update=(self.attn_prep_mode >= 3),
         )
 
         return self.o_proj(attn_out)[0]

@@ -5,7 +5,8 @@ kv_a_layernorm(kv_c), and GPT-J interleaved RoPE on q_pe and k_pe, in one pass.
 
 This replaces the torch.compile glue that the unfused MLA forward emits for the
 GLM-DSA decode path (kv_lora.split + kv_a_layernorm + rotary_emb on
-q[..., qk_nope:] and k_pe). Opt-in via VLLM_GLM_FUSED_MLA_ROPE.
+q[..., qk_nope:] and k_pe). Selected by VLLM_GLM_ATTN_PREP_OVERLAP >= 2 on the
+GLM-DSA decode path (see MultiHeadLatentAttentionWrapper).
 
 Numerics are matched to the unfused reference:
   - kv_a_layernorm matches csrc/.../layernorm_kernels.cu:
@@ -73,7 +74,6 @@ def _fused_mla_rope_kernel(
     cos_sin_ptr,
     cos_sin_stride0,
     NUM_HEADS: tl.constexpr,
-    QK_HEAD_DIM: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
     KV_LORA: tl.constexpr,
@@ -193,7 +193,6 @@ def fused_mla_split_rmsnorm_rope(
         cos_sin_cache,
         cos_sin_cache.stride(0),
         NUM_HEADS=num_heads,
-        QK_HEAD_DIM=qk_head_dim,
         NOPE_DIM=qk_nope_head_dim,
         ROPE_DIM=qk_rope_head_dim,
         KV_LORA=kv_lora_rank,

@@ -518,21 +518,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             compile_native=True,
         )
 
-        # GLM DSA attn-prep overlap (VLLM_GLM_ATTN_PREP_OVERLAP=4): persistent
-        # buffer + pre-allocated scratch for the hoisted decode mqa query.
-        # Defaults keep the standard path untouched; setup_precomputed_mqa()
-        # (called by the MLA wrapper when mode == 4, fp8 decode only) allocates
-        # them and flips use_precomputed_mqa on. The scratch means the hoisted
-        # bmm + concat + quant do ZERO graph-pool allocation on the main stream,
-        # avoiding the concurrent main+aux capture-time aliasing that corrupts.
+        # GLM DSA attn-prep overlap mode-4a (VLLM_GLM_ATTN_PREP_OVERLAP=4 +
+        # VLLM_GLM_ATTN_PREP_MQA_BMM_ONLY=1): persistent buffer for the hoisted
+        # decode-mqa W_UK-absorb bmm. Defaults keep the standard path untouched;
+        # setup_precomputed_mqa() (called by the MLA wrapper, fp8 decode only)
+        # allocates it and flips use_precomputed_mqa on. The persistent buffer
+        # means the hoisted bmm does ZERO graph-pool allocation on the main
+        # stream, avoiding the concurrent main+aux capture-time aliasing that
+        # corrupts. _mqa_ql_nope_buf (below) holds the bmm output (N, B, L flat);
+        # concat+quant stay eager in forward_impl.
         self.use_precomputed_mqa = False
         self.mqa_buf_capacity = 0
-        self._mqa_q_buf: torch.Tensor | None = None
-        self._mqa_bmm_scratch: torch.Tensor | None = None
-        self._mqa_cat_scratch: torch.Tensor | None = None
-        # Mode-4a: hoist ONLY the bmm; concat+quant stay eager in forward_impl.
-        # _mqa_ql_nope_buf holds the persistent bmm output (N, B, L flat).
-        self.mqa_bmm_only = False
         # Write/read handshake for the hoisted mqa buffer. The overlap op writes
         # at the step's PADDED token count (piecewise/graph padding) while
         # forward_impl reads at the ACTUAL count after the attention op narrows
@@ -643,24 +639,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             return output
 
     def setup_precomputed_mqa(self, bmm_only: bool = False) -> None:
-        """Allocate the persistent mqa buffer + shared scratch for the hoisted
-        decode query (GLM DSA attn-prep overlap mode 4, fp8 decode only). All
-        sized to the max cudagraph capture size. The captured prep op computes
-        the query with ZERO graph-pool allocation on the main stream (bmm ->
-        bmm_scratch, concat -> cat_scratch, quant -> _mqa_q_buf), so it never
-        allocates concurrently with the aux-stream indexer during capture (the
-        aliasing that corrupted the earlier per-step-alloc version). forward_impl
-        reads _mqa_q_buf across the eager-break (stable address, never freed).
-        The scratch is reused every layer (prep ops run serially on the main
-        stream, each consuming its scratch before returning).
+        """Allocate the persistent mqa buffer for the hoisted decode-mqa
+        W_UK-absorb bmm (GLM DSA attn-prep overlap mode 4a, fp8 decode only),
+        sized to the max cudagraph capture size. The captured prep op writes the
+        bmm output into it with ZERO graph-pool allocation on the main stream, so
+        it never allocates concurrently with the aux-stream indexer during
+        capture (the aliasing that corrupted the earlier per-step-alloc version).
+        forward_impl reads the buffer across the eager-break (stable address,
+        never freed) and runs concat+quant eagerly.
 
-        bmm_only (mode 4a): hoist ONLY the W_UK-absorb bmm. A single persistent
-        buffer holds the bmm output (N, B, L flat); forward_impl reads it and runs
-        concat+quant eagerly. Isolates the shared-cuBLAS-workspace bmm."""
+        Only mode 4a (bmm_only) is wired; full mode 4 (hoisting concat+quant too)
+        is not, so bmm_only=False leaves the hoist off (forward_impl recomputes
+        inline)."""
+        if not bmm_only:
+            return
         capture_sizes = self._vllm_config.compilation_config.cudagraph_capture_sizes
         cap = max(capture_sizes) if capture_sizes else 0
         if cap == 0:
-            return  # no cudagraph capture -> mode-4 read stays off (recompute)
+            return  # no cudagraph capture -> mode-4a read stays off (recompute)
         fp8 = (
             is_quantized_kv_cache(self.kv_cache_dtype)
             and self.impl.supports_quant_query_input
@@ -668,24 +664,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if not fp8 or self.q_pad_num_heads is not None or self.impl.dcp_world_size > 1:
             return  # hoist only supports the plain fp8 decode path
         self.mqa_buf_capacity = cap
-        self.mqa_bmm_only = bmm_only
         dev = current_platform.device_type
         adt = torch.get_default_dtype()
         n = self.num_heads
         L = self.kv_lora_rank
-        lr = self.kv_lora_rank + self.qk_rope_head_dim
-        if bmm_only:
-            # 4a: one persistent buffer holds the bmm output (N, B, L flat), read
-            # across the eager-break; concat+quant run eagerly in forward_impl.
-            self._mqa_ql_nope_buf = torch.empty(n * cap * L, dtype=adt, device=dev)
-        else:
-            # Final fp8 query buffer (concat of ql_nope + q_pe); scale is the
-            # static self._q_scale, already a persistent buffer.
-            self._mqa_q_buf = torch.empty(cap, n, lr, dtype=_FP8_DTYPE, device=dev)
-            # Flat scratch, viewed contiguously per-step: bmm out [n, B, L] and
-            # the bf16 concat [B, n, lr].
-            self._mqa_bmm_scratch = torch.empty(n * cap * L, dtype=adt, device=dev)
-            self._mqa_cat_scratch = torch.empty(cap * n * lr, dtype=adt, device=dev)
+        # One persistent buffer holds the bmm output (N, B, L flat), read across
+        # the eager-break; concat+quant run eagerly in forward_impl.
+        self._mqa_ql_nope_buf = torch.empty(n * cap * L, dtype=adt, device=dev)
         self.use_precomputed_mqa = True
 
     def precompute_mqa_bmm_into_buffer(self, q: torch.Tensor) -> None:
@@ -724,15 +709,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self,
         mqa_q: torch.Tensor,
         fp8_attention: bool,
-        eager_quant: bool = False,
-        out_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Topk-INDEPENDENT decode query preprocessing: split q into
         (nope, pe), absorb W_UK into the nope part (bmm), and optionally fp8-
         quantize. Returns the query object forward_mqa consumes (a fp8 pair, a
-        (ql_nope, q_pe) tuple, or a cat'd tensor for DCP). Extracted verbatim
-        from forward_impl so the DSA attn-prep overlap op can precompute it on
-        the default stream concurrent with the indexer; default path unchanged.
+        (ql_nope, q_pe) tuple, or a cat'd tensor for DCP). This is the inline
+        (non-hoisted) path; the mode-4a overlap precomputes the bmm separately
+        via precompute_mqa_bmm_into_buffer.
         """
         mqa_q_nope, mqa_q_pe = mqa_q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -776,10 +759,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self.q_pad_num_heads is not None:
                 mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
                 mqa_ql_nope.resize_((N, B, L))
-            elif out_scratch is not None:
-                # Mode-4 hoist: contiguous [N, B, L] view of the pre-allocated
-                # flat scratch — no graph-pool alloc on the main stream.
-                mqa_ql_nope = out_scratch[0][: N * B * L].view(N, B, L)
             else:
                 mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
@@ -792,38 +771,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if fp8_attention and self.impl.supports_quant_query_input:
             assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
             assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-            if out_scratch is not None:
-                # Mode-4 hoist: concat into the pre-allocated scratch and quant
-                # directly into the persistent fp8 buffer. Zero graph-pool alloc
-                # on the main stream (the concurrent main+aux capture-time
-                # allocation is what aliased and corrupted). Matches the eager
-                # per-tensor static quant of _decode_concat_quant_fp8_op.
-                _, cb, out_buf = out_scratch
-                b, nh, _ = mqa_ql_nope.shape
-                lr = self.kv_lora_rank + self.qk_rope_head_dim
-                cat_view = cb[: b * nh * lr].view(b, nh, lr)
-                torch.cat((mqa_ql_nope, mqa_q_pe), dim=-1, out=cat_view)
-                ops.scaled_fp8_quant(
-                    cat_view.reshape(b, -1),
-                    self._q_scale,
-                    output=out_buf[:b].view(b, -1),
-                    group_shape=(-1, -1),
-                )
-                mqa_q = out_buf[:b]
-            elif eager_quant:
-                # Called from inside a FULL-graph-captured op (the DSA attn-prep
-                # overlap, mode 4): invoke the eager CUDA quant directly instead
-                # of the CustomOp __call__, which under custom_ops=['none']
-                # dispatches to a torch.compile'd forward and would trigger a
-                # compile in the capture context (hang). forward_cuda is the
-                # same fused quant, numerically equivalent.
-                mqa_q = self._decode_concat_quant_fp8_op.forward_cuda(
-                    mqa_ql_nope, mqa_q_pe, self._q_scale
-                )
-            else:
-                mqa_q = self._decode_concat_quant_fp8_op(
-                    mqa_ql_nope, mqa_q_pe, self._q_scale
-                )
+            mqa_q = self._decode_concat_quant_fp8_op(
+                mqa_ql_nope, mqa_q_pe, self._q_scale
+            )
         else:
             mqa_q = (mqa_ql_nope, mqa_q_pe)
         if self.impl.dcp_world_size > 1:
@@ -950,14 +900,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             mqa_written = self._mqa_bmm_written_tokens
             self._mqa_bmm_written_tokens = None
             if self.use_precomputed_mqa and mqa_written == num_mqa_tokens:
-                if self.mqa_bmm_only:
-                    # 4a: bmm precomputed in the buffer; run split-pe + concat +
-                    # fp8 quant EAGERLY here (quant stays off the aux overlap).
-                    mqa_q = self._finish_mqa_from_precomputed_bmm(
-                        mqa_q, fp8_attention, num_mqa_tokens
-                    )
-                else:
-                    mqa_q = self._mqa_q_buf[:num_mqa_tokens]
+                # 4a: bmm precomputed in the persistent buffer by the overlap op;
+                # run split-pe + concat + fp8 quant EAGERLY here (quant stays off
+                # the aux overlap).
+                mqa_q = self._finish_mqa_from_precomputed_bmm(
+                    mqa_q, fp8_attention, num_mqa_tokens
+                )
             else:
                 mqa_q = self.compute_mqa_query(mqa_q, fp8_attention)
 
