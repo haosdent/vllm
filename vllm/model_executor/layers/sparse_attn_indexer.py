@@ -176,7 +176,11 @@ def sparse_attn_indexer(
             scale_fmt,
         )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # The top_k_per_row decode kernel fully writes [:rows, :topk] including
+    # -1 padding for short rows, so the pre-fill is only needed for prefill
+    # chunks and the persistent_topk path (which does not self-pad).
+    if has_prefill or num_decode_tokens >= _PERSISTENT_TOPK_MIN_ROWS:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
