@@ -768,6 +768,15 @@ class CompilationConfig:
         "vllm::sparse_attn_indexer",
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::deepseek_v4_attention",
+        # The GLM-DSA overlap wrappers run the indexer INSIDE an opaque op; they
+        # must split piecewise graphs exactly like vllm::sparse_attn_indexer,
+        # or mixed steps whose padded token count matches a capture size replay
+        # a piece with the indexer's capture-time state baked in (freed
+        # per-step metadata tensors, capture-time chunk topology) -> garbage
+        # top-k. FULL decode graphs capture the whole forward regardless, so
+        # the captured q_b_proj||indexer overlap is unaffected.
+        "vllm::dsa_attn_overlap",
+        "vllm::dsa_attn_overlap_prep",
     ]
 
     def compute_hash(self) -> str:
