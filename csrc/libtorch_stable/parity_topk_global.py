@@ -93,7 +93,6 @@ def _run_case(
         block_table,
         req_id,
         top_k,
-        max_len,
         block_size,
         num_pool_blocks,
     )
@@ -154,7 +153,7 @@ def _run_garbage_content_case(*, top_k: int, block_size: int, num_rows: int = 40
     valid_count = torch.empty((num_rows,), dtype=torch.int32, device="cuda")
     torch.ops._C.persistent_topk_global(
         logits, lengths, output, valid_count, block_table, req_id,
-        top_k, max_len, block_size, num_pool_blocks,
+        top_k, block_size, num_pool_blocks,
     )
     assert (output == -1).all(), f"garbage_k{top_k}: expected all -1 out (OOB guard)"
     assert (valid_count == 0).all(), f"garbage_k{top_k}: expected valid_count 0"
@@ -251,7 +250,7 @@ def test_persistent_buf_regrow_graph_safety() -> None:
     def run_fold():
         torch.ops._C.persistent_topk_global(
             logits, lengths, out, vc, block_table, req_id,
-            top_k, max_len, block_size, num_pool_blocks,
+            top_k, block_size, num_pool_blocks,
         )
 
     s = torch.cuda.Stream()

@@ -1,5 +1,5 @@
-// Persistent TopK global-index kernel for DeepSeek V3 sparse attention indexer.
-// See persistent_topk_global.cuh for kernel implementation.
+// Persistent TopK global-index kernel for the GLM-DSA (DeepSeek-V3.2-class)
+// sparse attention indexer. See persistent_topk_global.cuh for the kernel.
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -16,8 +16,8 @@ void persistent_topk_global(const torch::stable::Tensor& logits,
                              torch::stable::Tensor& valid_count,
                              const torch::stable::Tensor& block_table,
                              const torch::stable::Tensor& req_id,
-                             int64_t k, int64_t max_seq_len,
-                             int64_t block_size, int64_t num_pool_blocks) {
+                             int64_t k, int64_t block_size,
+                             int64_t num_pool_blocks) {
 #ifndef USE_ROCM
   STD_TORCH_CHECK(logits.is_cuda(), "logits must be CUDA tensor");
   STD_TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA tensor");
@@ -64,42 +64,30 @@ void persistent_topk_global(const torch::stable::Tensor& logits,
   STD_TORCH_CHECK(num_rows > 32,
                   "persistent_topk_global only supports FilteredTopK regime num_rows>32");
 
-  static_cast<void>(max_seq_len);
-
   const cudaStream_t stream = get_current_cuda_stream();
   cudaError_t status = cudaSuccess;
 
+  // Only k in {512, 1024, 2048} reaches here (checked above); each dispatches
+  // the same launcher with k as the MAX_K template constant.
+#define LAUNCH_TOPK_GLOBAL(K)                                                  \
+  vllm::FilteredTopKGlobalRaggedTransform<float, int32_t, K>(                  \
+      logits.const_data_ptr<float>(), output.mutable_data_ptr<int32_t>(),     \
+      valid_count.mutable_data_ptr<int32_t>(),                                 \
+      lengths.const_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),      \
+      static_cast<uint32_t>(k), static_cast<uint32_t>(max_len),                \
+      block_table.const_data_ptr<int32_t>(),                                  \
+      req_id.const_data_ptr<int32_t>(), static_cast<int>(bt_s0),              \
+      static_cast<int>(bt_s1), static_cast<int>(max_blocks),                  \
+      static_cast<int>(block_size), static_cast<int>(num_pool_blocks), stream)
+
   if (k == 512) {
-    status = vllm::FilteredTopKGlobalRaggedTransform<float, int32_t, 512>(
-        logits.const_data_ptr<float>(), output.mutable_data_ptr<int32_t>(),
-        valid_count.mutable_data_ptr<int32_t>(),
-        lengths.const_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
-        static_cast<uint32_t>(k), static_cast<uint32_t>(max_len),
-        block_table.const_data_ptr<int32_t>(), req_id.const_data_ptr<int32_t>(),
-        static_cast<int>(bt_s0), static_cast<int>(bt_s1),
-        static_cast<int>(max_blocks), static_cast<int>(block_size),
-        static_cast<int>(num_pool_blocks), stream);
+    status = LAUNCH_TOPK_GLOBAL(512);
   } else if (k == 1024) {
-    status = vllm::FilteredTopKGlobalRaggedTransform<float, int32_t, 1024>(
-        logits.const_data_ptr<float>(), output.mutable_data_ptr<int32_t>(),
-        valid_count.mutable_data_ptr<int32_t>(),
-        lengths.const_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
-        static_cast<uint32_t>(k), static_cast<uint32_t>(max_len),
-        block_table.const_data_ptr<int32_t>(), req_id.const_data_ptr<int32_t>(),
-        static_cast<int>(bt_s0), static_cast<int>(bt_s1),
-        static_cast<int>(max_blocks), static_cast<int>(block_size),
-        static_cast<int>(num_pool_blocks), stream);
+    status = LAUNCH_TOPK_GLOBAL(1024);
   } else {
-    status = vllm::FilteredTopKGlobalRaggedTransform<float, int32_t, 2048>(
-        logits.const_data_ptr<float>(), output.mutable_data_ptr<int32_t>(),
-        valid_count.mutable_data_ptr<int32_t>(),
-        lengths.const_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
-        static_cast<uint32_t>(k), static_cast<uint32_t>(max_len),
-        block_table.const_data_ptr<int32_t>(), req_id.const_data_ptr<int32_t>(),
-        static_cast<int>(bt_s0), static_cast<int>(bt_s1),
-        static_cast<int>(max_blocks), static_cast<int>(block_size),
-        static_cast<int>(num_pool_blocks), stream);
+    status = LAUNCH_TOPK_GLOBAL(2048);
   }
+#undef LAUNCH_TOPK_GLOBAL
   STD_TORCH_CHECK(status == cudaSuccess,
                   "FilteredTopKGlobal failed: ", cudaGetErrorString(status));
 

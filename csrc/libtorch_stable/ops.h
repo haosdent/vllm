@@ -309,7 +309,7 @@ void persistent_topk_global(const torch::stable::Tensor& logits,
                              torch::stable::Tensor& valid_count,
                              const torch::stable::Tensor& block_table,
                              const torch::stable::Tensor& req_id,
-                             int64_t k, int64_t max_seq_len, int64_t block_size,
+                             int64_t k, int64_t block_size,
                              int64_t num_pool_blocks);
 
 void selective_scan_fwd(

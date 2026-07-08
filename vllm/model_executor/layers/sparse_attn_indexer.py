@@ -429,7 +429,6 @@ def sparse_attn_indexer(
                 decode_metadata.block_table,
                 req_id,
                 topk_tokens,
-                attn_metadata_narrowed.max_seq_len,
                 block_size,
                 num_pool_blocks,
             )

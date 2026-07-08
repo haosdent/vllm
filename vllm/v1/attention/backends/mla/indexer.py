@@ -33,8 +33,8 @@ logger = init_logger(__name__)
 
 # Lever A (VLLM_GLM_TOPK_GLOBAL_FOLD): the DSA indexer can fold the block-table
 # local->global remap into its top-k kernel, so the attention backend
-# (flashmla_sparse) skips the separate convert and reads the top-k indices as
-# already-global slots. The fold decision is a pure function of per-step inputs;
+# (flashinfer_mla_sparse) skips the separate convert and reads the top-k indices
+# as already-global slots. The fold decision is a pure function of per-step inputs;
 # should_fold_topk_global below is the SINGLE place the gate expression lives.
 # The indexer is the authoritative site (it holds the exact inputs): it evaluates
 # the gate and PUBLISHES the resulting bool on the per-step forward_context
