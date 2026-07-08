@@ -605,6 +605,126 @@ __global__ void indexer_k_quant_and_cache_kernel(
   }
 }
 
+// Fused indexer-K pipeline: LayerNorm(k) -> RoPE(first rot_dim, GPT-J
+// interleaved) -> per-(quant_block_size) fp8 quant -> cache insert. Replaces the
+// Python k_norm + split + rotary_emb(k) + cat + indexer_k_quant_and_cache chain
+// for the DSA lightning indexer. Requires head_dim == quant_block_size so a
+// single warp (one block) covers the whole head_dim for the LayerNorm reduction.
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+__global__ void indexer_k_norm_rope_quant_and_cache_kernel(
+    const scalar_t* __restrict__ k,           // [num_tokens, head_dim] raw
+    const float* __restrict__ k_norm_weight,  // [head_dim] (fp32, like nn LN)
+    const float* __restrict__ k_norm_bias,    // [head_dim] (fp32)
+    const float norm_eps,
+    const scalar_t* __restrict__ cos_sin_cache,  // [max_pos, rot_dim] (k dtype)
+    const int64_t* __restrict__ positions,       // [num_tokens]
+    const int rot_dim,                            // = qk_rope_head_dim
+    cache_t* __restrict__ kv_cache,  // [num_blocks, block_size, cache_stride]
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int head_dim, const int quant_block_size, const int cache_block_size,
+    const int cache_stride, const bool use_ue8m0) {
+  constexpr int VEC_SIZE = 4;
+  const int64_t token_idx = blockIdx.x;
+  const int64_t head_dim_idx = (blockIdx.y * blockDim.y * blockDim.x +
+                                threadIdx.y * blockDim.x + threadIdx.x) *
+                               VEC_SIZE;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  const int64_t block_idx = slot_idx / cache_block_size;
+  const int64_t block_offset = slot_idx % cache_block_size;
+
+  // NOTE: slot_idx can be -1 if the token is padded
+  if (slot_idx < 0 || (head_dim_idx >= head_dim)) {
+    return;
+  }
+
+  // Load this lane's VEC_SIZE raw k values (fp32 accumulators).
+  float2 k_raw = (reinterpret_cast<const float2*>(
+      k))[(token_idx * head_dim + head_dim_idx) / VEC_SIZE];
+  scalar_t* k_raw_ptr = reinterpret_cast<scalar_t*>(&k_raw);
+  float kv[VEC_SIZE];
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; i++) {
+    kv[i] = static_cast<float>(k_raw_ptr[i]);
+  }
+
+  // ---- LayerNorm over head_dim (single-warp reduction; head_dim==quant_block).
+  float tsum = 0.0f, tsumsq = 0.0f;
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; i++) {
+    tsum += kv[i];
+    tsumsq += kv[i] * kv[i];
+  }
+  for (int mask = 16; mask > 0; mask /= 2) {
+#ifdef USE_ROCM
+    tsum += __shfl_xor_sync(uint64_t(-1), tsum, mask);
+    tsumsq += __shfl_xor_sync(uint64_t(-1), tsumsq, mask);
+#else
+    tsum += __shfl_xor_sync(unsigned(-1), tsum, mask);
+    tsumsq += __shfl_xor_sync(unsigned(-1), tsumsq, mask);
+#endif
+  }
+  const float mean = tsum / static_cast<float>(head_dim);
+  const float var = tsumsq / static_cast<float>(head_dim) - mean * mean;
+  const float rstd = rsqrtf(var + norm_eps);
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; i++) {
+    const float w = static_cast<float>(k_norm_weight[head_dim_idx + i]);
+    const float b = static_cast<float>(k_norm_bias[head_dim_idx + i]);
+    kv[i] = (kv[i] - mean) * rstd * w + b;
+  }
+
+  // ---- RoPE on the first rot_dim dims (GPT-J interleaved: pairs (2p, 2p+1)).
+  // indexer_rope_interleave=True => is_neox_style=False => GPT-J. Each lane's
+  // VEC_SIZE=4 contiguous elements form 2 interleaved pairs, fully local.
+  if (head_dim_idx < rot_dim) {
+    const int embed_dim = rot_dim / 2;
+    const scalar_t* cs = cos_sin_cache + positions[token_idx] * rot_dim;
+#pragma unroll
+    for (int pp = 0; pp < VEC_SIZE / 2; pp++) {
+      const int pair_idx = (static_cast<int>(head_dim_idx) + pp * 2) / 2;
+      const float cos = static_cast<float>(cs[pair_idx]);
+      const float sin = static_cast<float>(cs[pair_idx + embed_dim]);
+      const float x = kv[pp * 2];
+      const float y = kv[pp * 2 + 1];
+      kv[pp * 2] = x * cos - y * sin;
+      kv[pp * 2 + 1] = y * cos + x * sin;
+    }
+  }
+
+  // ---- per-(quant_block_size) fp8 quant + cache insert (matches base kernel).
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; i++) {
+    amax = fmaxf(amax, fabsf(kv[i]));
+  }
+  for (int mask = 16; mask > 0; mask /= 2) {
+#ifdef USE_ROCM
+    amax = fmaxf(amax, __shfl_xor_sync(uint64_t(-1), amax, mask));
+#else
+    amax = fmaxf(amax, __shfl_xor_sync(unsigned(-1), amax, mask));
+#endif
+  }
+  float scale = fmaxf(amax, 1e-4) / kFp8ScaleDivisor;
+  if (use_ue8m0) {
+    scale = exp2f(ceilf(log2f(scale)));
+  }
+
+  const int64_t dst_offset = block_idx * cache_block_size * cache_stride +
+                             block_offset * head_dim + head_dim_idx;
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; i++) {
+    kv_cache[dst_offset + i] = fp8::scaled_convert<cache_t, scalar_t, kv_dt>(
+        static_cast<scalar_t>(kv[i]), scale);
+  }
+  if (threadIdx.x == 0) {
+    const int64_t dst_scale_idx =
+        block_idx * cache_block_size * cache_stride +
+        cache_block_size * head_dim +
+        (block_offset * head_dim + head_dim_idx) * 4 / quant_block_size;
+    reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = scale;
+  }
+}
+
 template <int BLOCK_Y_SIZE>
 __global__ void cp_gather_indexer_k_quant_cache_kernel(
     const char* __restrict__ kv_cache,  // [num_blocks, block_size,
@@ -1484,6 +1604,75 @@ void indexer_k_quant_and_cache(
   static const std::string kv_cache_dtype = "fp8_e4m3";
   DISPATCH_BY_KV_CACHE_DTYPE(k.scalar_type(), kv_cache_dtype,
                              CALL_INDEXER_K_QUANT_AND_CACHE);
+}
+
+#define CALL_INDEXER_K_NORM_ROPE_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)       \
+  vllm::indexer_k_norm_rope_quant_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE>     \
+      <<<grid, block, 0, stream>>>(                                            \
+          reinterpret_cast<KV_T*>(k.data_ptr()),                               \
+          k_norm_weight.const_data_ptr<float>(),                              \
+          k_norm_bias.const_data_ptr<float>(),                                \
+          static_cast<float>(norm_eps),                                        \
+          reinterpret_cast<KV_T*>(cos_sin_cache.data_ptr()),                  \
+          positions.const_data_ptr<int64_t>(), static_cast<int>(rot_dim),      \
+          reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                     \
+          slot_mapping.const_data_ptr<int64_t>(), head_dim, quant_block_size,  \
+          cache_block_size, cache_stride, use_ue8m0);
+
+// Fused LayerNorm + RoPE(GPT-J interleaved) + fp8 quant + cache insert for the
+// DSA lightning-indexer K path. `k` is the raw post-GEMM K (pre-norm). Replaces
+// the Python k_norm + split + rotary_emb(k) + cat + indexer_k_quant_and_cache.
+void indexer_k_norm_rope_quant_and_cache(
+    torch::stable::Tensor& k,              // [num_tokens, head_dim] raw
+    torch::stable::Tensor& k_norm_weight,  // [head_dim]
+    torch::stable::Tensor& k_norm_bias,    // [head_dim]
+    double norm_eps,
+    torch::stable::Tensor& cos_sin_cache,  // [max_position, rot_dim]
+    torch::stable::Tensor& positions,      // [num_tokens]
+    int64_t rot_dim,
+    torch::stable::Tensor& kv_cache,  // [num_blocks, block_size, cache_stride]
+    torch::stable::Tensor& slot_mapping,  // [num_tokens]
+    int64_t quant_block_size,             // quantization block size
+    const std::string& scale_fmt) {
+  int num_tokens = k.size(0);
+  int head_dim = k.size(1);
+  int cache_block_size = kv_cache.size(1);
+  int cache_stride = kv_cache.size(2);
+  bool use_ue8m0 = scale_fmt == "ue8m0";
+
+  STD_TORCH_CHECK(k.device() == kv_cache.device(),
+                  "k and kv_cache must be on the same device");
+  STD_TORCH_CHECK(k.device() == slot_mapping.device(),
+                  "k and slot_mapping must be on the same device");
+  // The LayerNorm and amax reductions in the kernel are single-warp: one
+  // 32-lane warp, each lane holding VEC_SIZE(=4) elements, must cover the whole
+  // head_dim (and exactly one quant block). That only holds for
+  // head_dim == quant_block_size == 32 * VEC_SIZE == 128; a larger equal pair
+  // (e.g. 256) would silently reduce over half the elements.
+  STD_TORCH_CHECK(head_dim == quant_block_size && head_dim == 128,
+                  "fused indexer kernel requires head_dim == quant_block_size "
+                  "== 128 (single-warp reduction covers the whole head_dim)");
+  STD_TORCH_CHECK(
+      k_norm_weight.scalar_type() == torch::headeronly::ScalarType::Float,
+      "k_norm_weight must be fp32 (matches nn.LayerNorm)");
+  STD_TORCH_CHECK(
+      k_norm_bias.scalar_type() == torch::headeronly::ScalarType::Float,
+      "k_norm_bias must be fp32");
+  STD_TORCH_CHECK(cos_sin_cache.scalar_type() == k.scalar_type(),
+                  "cos_sin_cache must match k dtype (rope matches query dtype)");
+  STD_TORCH_CHECK(rot_dim <= head_dim, "rot_dim must be <= head_dim");
+
+  // head_dim == 128 == one 32-lane warp x VEC_SIZE, so a single (32, 1) block
+  // per token covers the whole head_dim and grid.y is always 1.
+  dim3 grid(num_tokens);
+  dim3 block(32, 1);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      k.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+
+  static const std::string kv_cache_dtype = "fp8_e4m3";
+  DISPATCH_BY_KV_CACHE_DTYPE(k.scalar_type(), kv_cache_dtype,
+                             CALL_INDEXER_K_NORM_ROPE_QUANT_AND_CACHE);
 }
 
 // Macro to dispatch the kernel based on the data amount.

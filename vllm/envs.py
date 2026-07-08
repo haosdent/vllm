@@ -18,6 +18,12 @@ if TYPE_CHECKING:
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
     VLLM_USE_MODELSCOPE: bool = False
     VLLM_USE_FASTOKENS: bool = False
+    # Opt-in: fuse the DSA lightning-indexer K path (LayerNorm + RoPE + fp8
+    # quant + cache) into a single kernel. Speeds up prefill/long-context
+    # (e.g. ~+12% on 8k-in summ) but moves k_norm+RoPE out of the decode
+    # cudagraph, so it is off by default to avoid a small short-context
+    # decode regression.
+    VLLM_FUSED_INDEXER_K: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
@@ -685,6 +691,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (`hf`, `deepseek_v32`, `deepseek_v4`, `qwen_vl`, …). The `fastokens`
     # Python package must be installed.
     "VLLM_USE_FASTOKENS": lambda: bool(int(os.getenv("VLLM_USE_FASTOKENS", "0"))),
+    # Opt-in fused DSA indexer-K kernel (off by default; see decl above).
+    "VLLM_FUSED_INDEXER_K": lambda: bool(
+        int(os.getenv("VLLM_FUSED_INDEXER_K", "0"))
+    ),
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(
         os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")

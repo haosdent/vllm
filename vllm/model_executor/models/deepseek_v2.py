@@ -70,6 +70,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     scaled_dequantize,
 )
+import vllm.envs as envs
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import (
     SparseAttnIndexer,
@@ -674,6 +675,14 @@ class Indexer(nn.Module):
         )
 
         self.is_inplace_rope = is_inplace_rope
+        # Opt-in fused indexer-K cache kernel (off by default; see
+        # envs.VLLM_FUSED_INDEXER_K). The fused op is CUDA-only; gate on the
+        # platform so the ROCm/XPU indexer paths (forward_hip/forward_xpu, which
+        # drop the fused K-norm/rope params) can never route the raw, un-normed
+        # K to the plain quant+cache kernel.
+        self.use_fused_indexer_k = (
+            envs.VLLM_FUSED_INDEXER_K and current_platform.is_cuda()
+        )
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
@@ -681,6 +690,12 @@ class Indexer(nn.Module):
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 
+        # Fused-K cache kernel params (CUDA path only). When set, the indexer op
+        # runs LayerNorm + RoPE + fp8 quant + cache in one kernel on the raw K,
+        # so we skip the Python k_norm/split/rope/cat below. None => legacy path.
+        fused_k_norm_w = None
+        fused_k_norm_b = None
+        fused_cos_sin = None
         if current_platform.is_rocm() and self.is_inplace_rope:
             # This path should works on all platform, will remove extra
             # branches in the future
@@ -698,6 +713,26 @@ class Indexer(nn.Module):
             rotary_emb(
                 positions, q[..., : self.rope_dim], k[..., : self.rope_dim].unsqueeze(1)
             )
+        elif self.use_fused_indexer_k:
+            q_pe, q_nope = torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            # Fused wk + weights_proj: one GEMM, then split
+            kw, _ = self.wk_weights_proj(hidden_states)
+            # K stays raw: LayerNorm + RoPE are fused into the indexer cache
+            # kernel (indexer_k_norm_rope_quant_and_cache), which SGLang-style
+            # avoids the separate k_norm + k-rope + prep kernels here.
+            k = kw[:, : self.head_dim]
+            weights = kw[:, self.head_dim :]
+
+            # q-only RoPE; k's RoPE is applied inside the fused cache kernel.
+            q_pe, _ = rotary_emb(positions, q_pe, None)
+            q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+            q = torch.cat([q_pe, q_nope], dim=-1)
+
+            fused_k_norm_w = self.k_norm.weight
+            fused_k_norm_b = self.k_norm.bias
+            fused_cos_sin = rotary_emb.cos_sin_cache
         else:
             q_pe, q_nope = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
@@ -740,7 +775,18 @@ class Indexer(nn.Module):
         )
         weights = weights.squeeze(-1)
 
-        return self.indexer_op(hidden_states, q_fp8, k, weights)
+        return self.indexer_op(
+            hidden_states,
+            q_fp8,
+            k,
+            weights,
+            k_norm_weight=fused_k_norm_w,
+            k_norm_bias=fused_k_norm_b,
+            norm_eps=self.k_norm.eps,
+            cos_sin_cache=fused_cos_sin,
+            positions=positions,
+            rot_dim=self.rope_dim,
+        )
 
 
 def _try_load_fp8_indexer_wk(

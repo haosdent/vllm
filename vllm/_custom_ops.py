@@ -2925,6 +2925,34 @@ def indexer_k_quant_and_cache(
     )
 
 
+def indexer_k_norm_rope_quant_and_cache(
+    k: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    rot_dim: int,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    quant_block_size: int,
+    kv_cache_dtype: str,
+) -> None:
+    torch.ops._C_cache_ops.indexer_k_norm_rope_quant_and_cache(
+        k,
+        k_norm_weight,
+        k_norm_bias,
+        norm_eps,
+        cos_sin_cache,
+        positions,
+        rot_dim,
+        kv_cache,
+        slot_mapping,
+        quant_block_size,
+        kv_cache_dtype,
+    )
+
+
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     cu_seqlen_ks: torch.Tensor,

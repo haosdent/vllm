@@ -798,6 +798,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "slot_mapping, "
       "int quant_block_size, str kv_cache_dtype) -> ()");
 
+  ops.def(
+      "indexer_k_norm_rope_quant_and_cache(Tensor k, Tensor k_norm_weight, "
+      "Tensor k_norm_bias, float norm_eps, Tensor cos_sin_cache, Tensor "
+      "positions, int rot_dim, Tensor! kv_cache, Tensor slot_mapping, "
+      "int quant_block_size, str kv_cache_dtype) -> ()");
+
   ops.def("concat_mla_q(Tensor ql_nope, Tensor q_pe, Tensor! q_out) -> ()");
 
   ops.def(
@@ -862,6 +868,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
   ops.impl("cp_gather_and_upconvert_fp8_kv_cache",
            TORCH_BOX(&cp_gather_and_upconvert_fp8_kv_cache));
   ops.impl("indexer_k_quant_and_cache", TORCH_BOX(&indexer_k_quant_and_cache));
+  ops.impl("indexer_k_norm_rope_quant_and_cache",
+           TORCH_BOX(&indexer_k_norm_rope_quant_and_cache));
   ops.impl("concat_mla_q", TORCH_BOX(&concat_mla_q));
   ops.impl("cp_gather_indexer_k_quant_cache",
            TORCH_BOX(&cp_gather_indexer_k_quant_cache));

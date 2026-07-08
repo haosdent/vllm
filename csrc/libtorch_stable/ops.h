@@ -538,6 +538,20 @@ void indexer_k_quant_and_cache(
     int64_t quant_block_size,             // quantization block size
     const std::string& scale_fmt);
 
+void indexer_k_norm_rope_quant_and_cache(
+    torch::stable::Tensor& k,              // [num_tokens, head_dim] raw
+    torch::stable::Tensor& k_norm_weight,  // [head_dim]
+    torch::stable::Tensor& k_norm_bias,    // [head_dim]
+    double norm_eps,
+    torch::stable::Tensor& cos_sin_cache,  // [max_position, rot_dim]
+    torch::stable::Tensor& positions,      // [num_tokens]
+    int64_t rot_dim,
+    torch::stable::Tensor& kv_cache,      // [num_blocks, block_size,
+                                          // cache_stride]
+    torch::stable::Tensor& slot_mapping,  // [num_tokens]
+    int64_t quant_block_size,             // quantization block size
+    const std::string& scale_fmt);
+
 // Concatenate query nope and rope for MLA/DSA attention
 void concat_mla_q(
     torch::stable::Tensor& ql_nope,  // [num_tokens, num_heads, nope_dim]
