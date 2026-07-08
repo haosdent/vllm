@@ -687,6 +687,98 @@ class Indexer(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
+        (
+            q_fp8,
+            k,
+            weights,
+            fused_k_norm_w,
+            fused_k_norm_b,
+            fused_cos_sin,
+        ) = self._prepare_indexer_inputs(hidden_states, qr, positions, rotary_emb)
+        return self.indexer_op(
+            hidden_states,
+            q_fp8,
+            k,
+            weights,
+            k_norm_weight=fused_k_norm_w,
+            k_norm_bias=fused_k_norm_b,
+            norm_eps=self.k_norm.eps,
+            cos_sin_cache=fused_cos_sin,
+            positions=positions,
+            rot_dim=self.rope_dim,
+        )
+
+    def forward_via_function(
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ) -> torch.Tensor:
+        """Same as forward() but calls the sparse_attn_indexer FUNCTION directly
+        instead of the registered custom op. Used inside an eager-break /
+        multi-stream region (deepseek_v4-style), where nesting the registered
+        @eager_break_during_capture op would break cudagraph capture."""
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            sparse_attn_indexer,
+        )
+        from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
+        from vllm.utils.torch_utils import _encode_layer_name
+
+        # Already inside an eager-break region: call the UNWRAPPED indexer logic
+        # so its own @eager_break_during_capture decorator does not nest-break
+        # (nesting the registered op was the -22% capture bug).
+        _sai = getattr(sparse_attn_indexer, "__wrapped__", sparse_attn_indexer)
+        op = self.indexer_op
+
+        assert self.use_fused_indexer_k, (
+            "forward_via_function requires VLLM_FUSED_INDEXER_K=1 (K fused in kernel)"
+        )
+        # Q + (wk + weights) GEMMs.
+        q_raw = self.wq_b(qr)[0].view(-1, self.n_head, self.head_dim)
+        kw, _ = self.wk_weights_proj(hidden_states)
+        k = kw[:, : self.head_dim]
+        weights_raw = kw[:, self.head_dim :]
+        # Fused Q: GPT-J interleaved RoPE + fp8/fp4 quant + weight-fold, ONE
+        # launch (vs ~4 unfused), reusing deepseek_v4's kernel. K's norm/rope/
+        # quant/cache stay fused inside sparse_attn_indexer (fused-K path).
+        q_quant, weights = fused_indexer_q_rope_quant(
+            positions,
+            q_raw,
+            rotary_emb.cos_sin_cache,
+            weights_raw,
+            self.softmax_scale,
+            self.n_head**-0.5,
+            use_fp4=op.use_fp4_cache,
+        )
+        if isinstance(q_quant, tuple):
+            q_values, q_scale = q_quant
+        else:
+            q_values, q_scale = q_quant, None
+        return _sai(
+            hidden_states,
+            _encode_layer_name(op.k_cache.prefix),
+            op.k_cache.kv_cache,
+            q_values,
+            q_scale,
+            k,
+            weights,
+            op.quant_block_size,
+            op.scale_fmt,
+            op.topk_tokens,
+            op.head_dim,
+            op.max_model_len,
+            op.max_total_seq_len,
+            op.topk_indices_buffer,
+            op.skip_k_cache_insert,
+            op.use_fp4_cache,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.eps,
+            rotary_emb.cos_sin_cache,
+            positions,
+            self.rope_dim,
+        )
+
+    def _prepare_indexer_inputs(
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ):
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 
@@ -775,18 +867,7 @@ class Indexer(nn.Module):
         )
         weights = weights.squeeze(-1)
 
-        return self.indexer_op(
-            hidden_states,
-            q_fp8,
-            k,
-            weights,
-            k_norm_weight=fused_k_norm_w,
-            k_norm_bias=fused_k_norm_b,
-            norm_eps=self.k_norm.eps,
-            cos_sin_cache=fused_cos_sin,
-            positions=positions,
-            rot_dim=self.rope_dim,
-        )
+        return q_fp8, k, weights, fused_k_norm_w, fused_k_norm_b, fused_cos_sin
 
 
 def _try_load_fp8_indexer_wk(
