@@ -715,29 +715,52 @@ class Indexer(nn.Module):
         instead of the registered custom op. Used inside an eager-break /
         multi-stream region (deepseek_v4-style), where nesting the registered
         @eager_break_during_capture op would break cudagraph capture."""
+        assert self.use_fused_indexer_k, (
+            "forward_via_function requires VLLM_FUSED_INDEXER_K=1 (K fused in kernel)"
+        )
+        # Fused wk + weights_proj: one GEMM, then split. K stays raw (pre-norm,
+        # pre-rope); its norm/rope/quant/cache stays fused inside
+        # sparse_attn_indexer, so skip_k_cache_insert follows the op's decision.
+        kw, _ = self.wk_weights_proj(hidden_states)
+        k = kw[:, : self.head_dim]
+        weights_raw = kw[:, self.head_dim :]
+        return self._qside(
+            hidden_states,
+            qr,
+            positions,
+            rotary_emb,
+            weights_raw,
+            k,
+            self.indexer_op.skip_k_cache_insert,
+        )
+
+    def _qside(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions,
+        rotary_emb,
+        weights_raw: torch.Tensor,
+        k: torch.Tensor,
+        skip_k_cache_insert: bool,
+    ) -> torch.Tensor:
+        """Q-side of the indexer for the multi-stream overlap paths: wq_b + the
+        fused Q GPT-J-rope/quant/weight-fold (ONE launch vs ~4 unfused, reusing
+        deepseek_v4's kernel) + logits + top-k. Calls the UNWRAPPED
+        sparse_attn_indexer directly so its own @eager_break_during_capture
+        decorator does not nest-break (nesting the registered op was the -22%
+        capture bug). Shared by forward_via_function (K computed there) and
+        qside_finish (K already run by kside_fork); skip_k_cache_insert selects
+        whether the indexer still inserts the fused K cache."""
         from vllm.model_executor.layers.sparse_attn_indexer import (
             sparse_attn_indexer,
         )
         from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
         from vllm.utils.torch_utils import _encode_layer_name
 
-        # Already inside an eager-break region: call the UNWRAPPED indexer logic
-        # so its own @eager_break_during_capture decorator does not nest-break
-        # (nesting the registered op was the -22% capture bug).
         _sai = getattr(sparse_attn_indexer, "__wrapped__", sparse_attn_indexer)
         op = self.indexer_op
-
-        assert self.use_fused_indexer_k, (
-            "forward_via_function requires VLLM_FUSED_INDEXER_K=1 (K fused in kernel)"
-        )
-        # Q + (wk + weights) GEMMs.
         q_raw = self.wq_b(qr)[0].view(-1, self.n_head, self.head_dim)
-        kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
-        weights_raw = kw[:, self.head_dim :]
-        # Fused Q: GPT-J interleaved RoPE + fp8/fp4 quant + weight-fold, ONE
-        # launch (vs ~4 unfused), reusing deepseek_v4's kernel. K's norm/rope/
-        # quant/cache stay fused inside sparse_attn_indexer (fused-K path).
         q_quant, weights = fused_indexer_q_rope_quant(
             positions,
             q_raw,
@@ -766,7 +789,7 @@ class Indexer(nn.Module):
             op.max_model_len,
             op.max_total_seq_len,
             op.topk_indices_buffer,
-            op.skip_k_cache_insert,
+            skip_k_cache_insert,
             op.use_fp4_cache,
             self.k_norm.weight,
             self.k_norm.bias,
@@ -774,6 +797,90 @@ class Indexer(nn.Module):
             rotary_emb.cos_sin_cache,
             positions,
             self.rope_dim,
+        )
+
+    def kside_fork(
+        self,
+        hidden_states: torch.Tensor,
+        positions,
+        rotary_emb,
+        kw_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """Stage-1 (K-side) of the two-stage K-side early-fork. Runs the parts of
+        the indexer that depend ONLY on hidden_states (+ positions): the fused
+        wk_weights_proj GEMM and the fused K norm/rope/quant/cache insert. These
+        carry no q_c dependency, so this method is launched on the aux stream at
+        layer start to overlap fused_qkv_a_proj + q_a_norm on the main stream.
+
+        Returns (weights_raw, k, inserted): the pre-fold weights and raw K,
+        held for qside_finish(), and whether the K cache insert actually ran —
+        the caller must only route Stage-2 to skip_k_cache_insert=True when
+        inserted is True (single source of truth; a capture must never bake
+        the skip without the matching insert).
+
+        kw_out: optional persistent scratch. When given, the GEMM writes into
+        it (torch.mm out=) so the aux stream performs no graph-pool allocation
+        concurrent with the main stream's captured window, and the returned
+        views are address-stable across replays."""
+        from vllm.forward_context import get_forward_context
+        from vllm.utils.torch_utils import _encode_layer_name, _resolve_layer_name
+
+        assert self.use_fused_indexer_k, (
+            "kside_fork requires VLLM_FUSED_INDEXER_K=1 (K fused in kernel)"
+        )
+        op = self.indexer_op
+        # Fused wk + weights_proj: one GEMM, then split. K stays raw (pre-norm,
+        # pre-rope); its norm/rope/quant are fused into the cache-insert kernel.
+        if kw_out is not None:
+            kw = kw_out[: hidden_states.shape[0]]
+            torch.mm(hidden_states, self.wk_weights_proj.weight.t(), out=kw)
+        else:
+            kw, _ = self.wk_weights_proj(hidden_states)
+        k = kw[:, : self.head_dim]
+        weights_raw = kw[:, self.head_dim :]
+
+        # Fused K norm+rope+fp8-quant+cache insert — the SAME kernel _sai uses,
+        # hoisted here so it overlaps the fused_qkv_a window. Skipped during the
+        # dummy/profiling run (attn_metadata is not a dict) exactly like _sai, and
+        # when the op is configured to insert elsewhere (op.skip_k_cache_insert).
+        inserted = False
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, dict) and not op.skip_k_cache_insert:
+            k_cache_prefix = _resolve_layer_name(_encode_layer_name(op.k_cache.prefix))
+            md = attn_metadata[k_cache_prefix]
+            slot_mapping = md.slot_mapping
+            num_tokens = slot_mapping.shape[0]
+            ops.indexer_k_norm_rope_quant_and_cache(
+                k[:num_tokens],
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.eps,
+                rotary_emb.cos_sin_cache,
+                positions[:num_tokens],
+                self.rope_dim,
+                op.k_cache.kv_cache,
+                slot_mapping,
+                op.quant_block_size,
+                op.scale_fmt,
+            )
+            inserted = True
+        return weights_raw, k, inserted
+
+    def qside_finish(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions,
+        rotary_emb,
+        weights_raw: torch.Tensor,
+        k: torch.Tensor,
+    ) -> torch.Tensor:
+        """Stage-2 (Q-side) of the two-stage K-side early-fork. The K cache
+        insert was already done in kside_fork(), so the indexer runs with
+        skip_k_cache_insert=True. Delegates to _qside (shared with
+        forward_via_function)."""
+        return self._qside(
+            hidden_states, qr, positions, rotary_emb, weights_raw, k, True
         )
 
     def _prepare_indexer_inputs(
