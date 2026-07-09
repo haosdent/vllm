@@ -7,6 +7,7 @@ import torch
 from vllm import envs
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -17,6 +18,8 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     is_quantized_kv_cache,
 )
+
+logger = init_logger(__name__)
 
 
 # Persistent output buffers for the overlap ops when they run OUTSIDE cudagraph
@@ -245,7 +248,7 @@ def _dsa_attn_overlap_prep_impl(
         # with the Q-side only. Same-stream ordering makes the Stage-1 ->
         # Stage-2 dependency free. Clear-after-read so a fallback step never
         # consumes stale state (the mode-4 lesson).
-        if getattr(self, "_kside_forked", False):
+        if self._kside_forked:
             self._kside_forked = False
             weights_raw, k = self._kside_state
             self._kside_state = None
@@ -339,7 +342,7 @@ def _dsa_kside_fork_impl(
     after Stage-1 for free, and its join event covers Stage-1's work — no join
     here (fork-only is capture-legal because Stage-2 always rejoins).
 
-    Contract (the campaign's four laws):
+    Contract (the campaign's laws, each from a debugged failure):
     - fork ONLY inside cudagraph capture (eager forks raced on uncaptured
       shapes); eager/mixed steps return immediately and Stage-2 runs the full
       indexer chain exactly as the certified path does;
@@ -380,7 +383,7 @@ def _dsa_kside_fork_impl(
         self._kside_forked = True
         if n not in _kside_baked_sizes:
             _kside_baked_sizes.add(n)
-            print(f"[KSIDE] fork baked into capture n={n}", flush=True)
+            logger.info("[KSIDE] fork baked into capture n=%d", n)
 
 
 def _dsa_kside_fork_fake(
