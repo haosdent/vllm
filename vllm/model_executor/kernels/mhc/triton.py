@@ -63,6 +63,62 @@ def rmsnorm_nw(x: Tensor, eps: float) -> Tensor:
 
 
 @triton.jit
+def _row_sqrsum_kernel(
+    x_ptr,
+    out_ptr,
+    stride_row,
+    K,
+    BLOCK_K: tl.constexpr,
+):
+    """Compute one FP32 sum of squares per input row."""
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_K)
+    accumulator = tl.zeros([BLOCK_K], dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_K):
+        values = tl.load(
+            x_ptr + row * stride_row + k_start + offsets,
+            mask=k_start + offsets < K,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        accumulator += values * values
+    tl.store(out_ptr + row, tl.sum(accumulator))
+
+
+def hc_prenorm_gemm_cublas(
+    x: Tensor,
+    fn: Tensor,
+    out: Tensor,
+    sqrsum: Tensor,
+) -> None:
+    """Run the SM80 prenorm projection as a BF16 cuBLAS GEMM plus sqrsum.
+
+    The fused TileLang kernels re-read the FP32 ``fn`` matrix for each token
+    tile. At prefill sizes on SM80, caching one BF16 copy of ``fn`` and reading
+    ``x`` once for cuBLAS and once for the reduction is substantially cheaper.
+    The GEMM keeps an FP32 output, so only the static weight is rounded to BF16.
+    """
+    assert out.shape[0] == 1 and sqrsum.shape[0] == 1
+    fn_bf16 = getattr(fn, "_hc_prenorm_bf16", None)
+    if fn_bf16 is None:
+        # Inference weights are static. Keep the converted copy on the weight
+        # tensor so its lifetime follows the source without a global cache.
+        fn_bf16 = fn.to(torch.bfloat16)
+        fn._hc_prenorm_bf16 = fn_bf16
+
+    torch.mm(x, fn_bf16.t(), out_dtype=torch.float32, out=out[0])
+    num_rows, hidden_width = x.shape
+    _row_sqrsum_kernel[(num_rows,)](
+        x,
+        sqrsum[0],
+        x.stride(0),
+        hidden_width,
+        BLOCK_K=1024,
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _hc_head_reduce_store_kernel(
     pre_ptr,
     x_ptr,

@@ -2,7 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+_PRENORM_CUBLAS_MIN_TOKENS = 32
+_PRENORM_USE_CUBLAS = True
+
+
+def _can_use_sm80_cublas_hc_prenorm_gemm(
+    x: torch.Tensor,
+    n_splits: int,
+    use_default_config: bool,
+) -> bool:
+    return (
+        _PRENORM_USE_CUBLAS
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(80)
+        and n_splits == 1
+        and use_default_config
+        and x.dtype == torch.bfloat16
+        and x.shape[0] >= _PRENORM_CUBLAS_MIN_TOKENS
+    )
 
 
 def _torch_hc_prenorm_gemm(
@@ -40,6 +60,11 @@ def _tilelang_hc_prenorm_gemm(
     assert x.shape[1] % n_splits == 0
     assert (x.shape[1] // n_splits) % n_thr == 0
     use_default_config = tile_n == 12 and n_thr == 512
+    if _can_use_sm80_cublas_hc_prenorm_gemm(x, n_splits, use_default_config):
+        from vllm.model_executor.kernels.mhc.triton import hc_prenorm_gemm_cublas
+
+        hc_prenorm_gemm_cublas(x, fn, out, sqrsum)
+        return
     if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
         hc_prenorm_gemm_block_m_tilelang(
             x,
