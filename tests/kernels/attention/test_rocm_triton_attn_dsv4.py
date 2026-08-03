@@ -8,27 +8,30 @@ import torch
 
 from vllm.platforms import current_platform
 
+_capability = current_platform.get_device_capability()
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_rocm(), reason="Only used by ROCm"
+    not (
+        current_platform.is_rocm()
+        or (
+            current_platform.is_cuda()
+            and _capability is not None
+            and _capability.major == 8
+        )
+    ),
+    reason="ROCm or CUDA SM8x only",
 )
 
 
 def _on_split_decode_arch() -> bool:
-    if not current_platform.is_rocm():
-        return False
-    try:
-        from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _use_split_k_decode
 
-        return bool(_ON_GFX942 or _ON_GFX950)
-    except Exception:
-        return False
+    return _use_split_k_decode()
 
 
-# The flash-decode split-K decode path is only tuned for AMD gfx942/gfx950; other
-# architectures take the fallback decode kernel, so its tests are skipped there.
+# Split-K decode runs on CUDA and the tuned AMD gfx942/gfx950 architectures.
 requires_split_decode_arch = pytest.mark.skipif(
     not _on_split_decode_arch(),
-    reason="split-K decode kernel is only tuned for AMD gfx942/gfx950",
+    reason="split-K decode path not selected on this architecture",
 )
 
 NOPE_HEAD_DIM = 448
@@ -428,11 +431,9 @@ def test_sparse_attn_decode_split_k_kernel(
 ) -> None:
     """Flash-decode split-K decode path (partial + reduce kernels).
 
-    This path is the gfx942/gfx950 production path, so the test only runs on
-    those architectures. The split count is pinned so the partial/reduce kernels are
-    exercised across split counts. ``num_splits=8`` drives splits past the
-    shortest segment length, covering the empty-split edge case handled by the
-    reduce kernel.
+    The split count is pinned so the partial/reduce kernels are exercised across
+    split counts. ``num_splits=8`` drives splits past the shortest segment length,
+    covering the empty-split edge case handled by the reduce kernel.
     """
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
 
@@ -716,3 +717,87 @@ def test_get_cached_wo_a_bf16_fp8_blockscale_caches() -> None:
 
     # Second call returns the same cached object.
     assert _get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim) is out
+
+
+def test_ampere_backend_capability_and_metadata_builder() -> None:
+    if not current_platform.is_cuda():
+        pytest.skip("Ampere-only integration")
+
+    from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+        DeepseekV4AmpereMLASparseBackend,
+        DeepseekV4AmpereSparseSWAMetadataBuilder,
+    )
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+
+    assert DeepseekV4AmpereMLASparseBackend.supports_compute_capability(
+        DeviceCapability(8, 0)
+    )
+    assert not DeepseekV4AmpereMLASparseBackend.supports_compute_capability(
+        DeviceCapability(9, 0)
+    )
+
+    builder = object.__new__(DeepseekV4AmpereSparseSWAMetadataBuilder)
+    scheduler = builder.build_tile_scheduler(num_decode_tokens=1)
+    assert set(scheduler) == {"swaonly", "c4a", "c128a"}
+    assert all(value is None for value in scheduler.values())
+    assert (
+        DeepseekSparseSWABackend.get_builder_cls()
+        is DeepseekV4AmpereSparseSWAMetadataBuilder
+    )
+
+
+def test_ampere_model_backend_selection() -> None:
+    if not current_platform.is_cuda():
+        pytest.skip("Ampere-only integration")
+
+    from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+        DeepseekV4AmpereMLAAttention,
+    )
+    from vllm.models.deepseek_v4.nvidia.model import _select_dsv4_attn_cls
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    attention_config = SimpleNamespace(
+        backend=None,
+        use_fp4_indexer_cache=False,
+    )
+    config = SimpleNamespace(attention_config=attention_config)
+    assert _select_dsv4_attn_cls(config) is DeepseekV4AmpereMLAAttention
+
+    attention_config.backend = AttentionBackendEnum.FLASHMLA_SPARSE_DSV4
+    with pytest.raises(ValueError, match="not supported.*SM8x"):
+        _select_dsv4_attn_cls(config)
+
+    attention_config.backend = None
+    attention_config.use_fp4_indexer_cache = True
+    with pytest.raises(ValueError, match="requires SM100"):
+        _select_dsv4_attn_cls(config)
+
+
+def test_ampere_mqa_warmup_is_cached(monkeypatch) -> None:
+    if not current_platform.is_cuda():
+        pytest.skip("Ampere-only integration")
+
+    from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+        _warmup_ampere_mqa_logits,
+    )
+    from vllm.v1.attention.ops import mqa_logits_triton
+
+    calls: list[tuple[str, int | None]] = []
+    monkeypatch.setattr(
+        mqa_logits_triton,
+        "warmup_fp8_mqa_logits_triton",
+        lambda *_args: calls.append(("prefill", None)),
+    )
+    monkeypatch.setattr(
+        mqa_logits_triton,
+        "warmup_fp8_paged_mqa_logits_triton",
+        lambda _heads, _dim, block_size, _device: calls.append(("decode", block_size)),
+    )
+
+    _warmup_ampere_mqa_logits.cache_clear()
+    args = (64, 128, (64, 256), torch.device("cuda"))
+    _warmup_ampere_mqa_logits(*args)
+    _warmup_ampere_mqa_logits(*args)
+
+    assert calls == [("prefill", None), ("decode", 64), ("decode", 256)]

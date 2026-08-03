@@ -126,6 +126,17 @@ class DeepseekSparseSWABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
+        capability = current_platform.get_device_capability()
+        if (
+            current_platform.is_cuda()
+            and capability is not None
+            and capability.major == 8
+        ):
+            from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+                DeepseekV4AmpereSparseSWAMetadataBuilder,
+            )
+
+            return DeepseekV4AmpereSparseSWAMetadataBuilder
         if current_platform.is_rocm():
             from vllm.models.deepseek_v4.amd.rocm import (
                 DeepseekV4ROCMAiterSparseSWAMetadataBuilder,

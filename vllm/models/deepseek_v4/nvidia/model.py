@@ -762,11 +762,32 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
 
     The generic CUDA backend selector does not instantiate DSv4 layers directly,
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
-    Without an explicit backend, SM12 defaults to FlashInfer while the other
-    CUDA arches keep the FlashMLA path.
+    Without an explicit backend, SM8x uses the ragged Triton path, SM12 uses
+    FlashInfer, and the remaining supported CUDA arches use FlashMLA.
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
+    if device_capability is not None and device_capability.major == 8:
+        if (
+            backend is not None
+            and backend != AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4
+        ):
+            raise ValueError(
+                f"{backend.name} is not supported for DeepSeek V4 on SM8x; "
+                "use TRITON_MLA_SPARSE_DSV4 (the default)."
+            )
+        if vllm_config.attention_config.use_fp4_indexer_cache:
+            raise ValueError(
+                "attention_config.use_fp4_indexer_cache requires SM100; "
+                "the MXFP4 indexer kernels emit Blackwell-only PTX."
+            )
+        from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+            DeepseekV4AmpereMLAAttention,
+        )
+
+        return DeepseekV4AmpereMLAAttention
+    if backend == AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4:
+        raise ValueError("TRITON_MLA_SPARSE_DSV4 is only supported on CUDA SM8x.")
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
