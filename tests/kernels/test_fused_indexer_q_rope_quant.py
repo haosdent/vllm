@@ -24,7 +24,8 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
 from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
-from vllm.utils.import_utils import has_cutedsl
+from vllm.platforms import current_platform
+from vllm.utils.import_utils import is_cutedsl_supported
 
 HEAD_DIM = 128
 ROPE_DIM = 64
@@ -132,8 +133,10 @@ def _reference(
 def test_fused_indexer_q_rope_quant_matches_unfused(
     num_tokens, cache_dtype, use_fp4, use_cutedsl
 ):
-    if use_cutedsl and not has_cutedsl():
-        pytest.skip("cutedsl (cutlass) not installed")
+    if use_fp4 and not current_platform.has_device_capability(100):
+        pytest.skip("MXFP4 indexer quantization requires SM100+")
+    if use_cutedsl and not is_cutedsl_supported():
+        pytest.skip("cutedsl is unavailable for this device")
 
     device = "cuda"
     torch.manual_seed(0)
@@ -150,11 +153,10 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
     q_quant_ref, weights_ref = _reference(
         positions, q, cos_sin_cache, weights, softmax_scale, head_scale, use_fp4
     )
-    # use_cutedsl=False: force the triton path even when cutedsl is installed
-    # by patching the dispatcher's has_cutedsl() binding to return False.
+    # use_cutedsl=False: force the Triton path when CuTe DSL is supported.
     cutedsl_patch = (
         mock.patch(
-            "vllm.models.deepseek_v4.common.ops.fused_indexer_q.has_cutedsl",
+            "vllm.models.deepseek_v4.common.ops.fused_indexer_q.is_cutedsl_supported",
             return_value=False,
         )
         if not use_cutedsl

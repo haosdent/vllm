@@ -560,6 +560,18 @@ def has_cutedsl() -> bool:
     return _has_module("cutlass")
 
 
+@cache
+def is_cutedsl_supported() -> bool:
+    """Whether CuTe DSL is installed and supported by the current device.
+
+    The DeepSeek V4 CuTe DSL kernels target SM90 or newer. Package presence
+    alone is therefore not a safe dispatch gate on pre-Hopper CUDA devices.
+    """
+    from vllm.platforms import current_platform
+
+    return has_cutedsl() and current_platform.has_device_capability(90)
+
+
 def has_humming() -> bool:
     """Whether the optional `humming` package is available."""
     return _has_module("humming")
