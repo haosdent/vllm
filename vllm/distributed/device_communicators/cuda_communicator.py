@@ -9,6 +9,7 @@ import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.device_communicators.all_reduce_utils import (
     NCCL_SYMM_MEM_ALL_REDUCE_CONFIG,
+    MiB,
     should_nccl_symm_mem_ag_rs,
     should_nccl_symm_mem_allreduce,
 )
@@ -24,6 +25,19 @@ from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+
+def _custom_allreduce_max_size_bytes(max_size_mb: int | None) -> int | None:
+    """Validate and convert the optional custom-allreduce payload cap.
+
+    ``CustomAllreduce`` treats ``max_size`` as an exclusive upper bound.
+    Returning ``None`` lets its built-in default remain unchanged.
+    """
+    if max_size_mb is None:
+        return None
+    if max_size_mb <= 0:
+        raise ValueError("VLLM_MAX_SIZE_MB_CUSTOM_ALL_REDUCE must be greater than 0")
+    return max_size_mb * MiB
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -116,12 +130,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            # The default exclusive cap (8 MiB) is below a tensor-parallel
+            # prefill step's payload, so those all-reduces fall back to NCCL;
+            # raising it is opt-in because both custom-AR IPC buffers grow.
+            max_size = _custom_allreduce_max_size_bytes(
+                envs.VLLM_MAX_SIZE_MB_CUSTOM_ALL_REDUCE
+            )
+            extra = {} if max_size is None else {"max_size": max_size}
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
                 symm_mem_enabled=(
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
+                **extra,
             )
 
         if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
