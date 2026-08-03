@@ -29,9 +29,15 @@ fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
   for (int i = 0; i < world_size; i++) {
     ipc_ptrs[i] = reinterpret_cast<vllm::Signal*>(fake_ipc_ptrs[i]);
   }
+
+  bool is_sm80 = false;
+#if !defined(USE_ROCM)
+  const auto* device_prop = get_device_prop();
+  is_sm80 = device_prop->major == 8 && device_prop->minor == 0;
+#endif
   return (fptr_t) new vllm::CustomAllreduce(
       ipc_ptrs, rank_data.mutable_data_ptr(), rank_data.numel(), rank,
-      world_size, fully_connected);
+      world_size, fully_connected, is_sm80);
 }
 
 /**

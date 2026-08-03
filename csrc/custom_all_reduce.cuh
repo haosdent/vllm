@@ -78,12 +78,41 @@ using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
 static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
 
+constexpr size_t custom_ar_one_shot_max_bytes(int world_size, bool is_sm80) {
+  if (world_size <= 4) {
+    return 512 * 1024;
+  }
+  if (world_size == 8 && is_sm80) {
+    return 448 * 1024;
+  }
+  return 256 * 1024;
+}
+
+constexpr bool custom_ar_use_one_shot(size_t bytes, int world_size,
+                                      bool is_sm80) {
+  if (world_size == 8 && is_sm80) {
+    return bytes <= custom_ar_one_shot_max_bytes(world_size, is_sm80);
+  }
+  return bytes < custom_ar_one_shot_max_bytes(world_size, is_sm80);
+}
+
+static_assert(custom_ar_one_shot_max_bytes(4, false) == 512 * 1024);
+static_assert(custom_ar_one_shot_max_bytes(6, true) == 256 * 1024);
+static_assert(custom_ar_one_shot_max_bytes(8, false) == 256 * 1024);
+static_assert(custom_ar_one_shot_max_bytes(8, true) == 448 * 1024);
+static_assert(custom_ar_use_one_shot(256 * 1024, 8, true));
+static_assert(custom_ar_use_one_shot(448 * 1024, 8, true));
+static_assert(!custom_ar_use_one_shot(448 * 1024 + 1, 8, true));
+static_assert(!custom_ar_use_one_shot(256 * 1024, 8, false));
+
 class CustomAllreduce {
  public:
   int rank_;
   int world_size_;
   // Full NVLink or xGMI connection between GPUs.
   bool fully_connected_;
+  // Whether the current CUDA device has compute capability 8.0.
+  bool is_sm80_;
 
   RankSignals sg_;
   // Stores a map from a pointer to its peer pointers from all ranks.
@@ -123,10 +152,12 @@ class CustomAllreduce {
    * are passed in from the constructor.
    */
   CustomAllreduce(Signal** signals, void* rank_data, size_t rank_data_sz,
-                  int rank, int world_size, bool fully_connected = true)
+                  int rank, int world_size, bool fully_connected = true,
+                  bool is_sm80 = false)
       : rank_(rank),
         world_size_(world_size),
         fully_connected_(fully_connected),
+        is_sm80_(is_sm80),
         self_sg_(signals[rank]),
         d_rank_data_base_(reinterpret_cast<RankData*>(rank_data)),
         d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData)) {
@@ -288,25 +319,27 @@ class CustomAllreduce {
 #define KL(ngpus, name)                                                       \
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
                                                  rank_, size);
-#define REDUCE_CASE(ngpus)                              \
-  case ngpus: {                                         \
-    if (force_1stage) {                                 \
-      KL(ngpus, cross_device_reduce_1stage);            \
-    } else if (force_2stage) {                          \
-      KL(ngpus, cross_device_reduce_2stage);            \
-    } else {                                            \
-      if (world_size_ == 2) {                           \
-        KL(ngpus, cross_device_reduce_1stage);          \
-      } else if (fully_connected_) {                    \
-        if ((world_size_ <= 4 && bytes < 512 * 1024) || \
-            (world_size_ <= 8 && bytes < 256 * 1024)) { \
-          KL(ngpus, cross_device_reduce_1stage);        \
-        } else {                                        \
-          KL(ngpus, cross_device_reduce_2stage);        \
-        }                                               \
-      }                                                 \
-    }                                                   \
-    break;                                              \
+    // Cudagraph measurements on TP8 A100 NVLink put the crossover above
+    // 448 KiB and below 464 KiB. Use that bound only for this setup.
+
+#define REDUCE_CASE(ngpus)                                          \
+  case ngpus: {                                                     \
+    if (force_1stage) {                                             \
+      KL(ngpus, cross_device_reduce_1stage);                        \
+    } else if (force_2stage) {                                      \
+      KL(ngpus, cross_device_reduce_2stage);                        \
+    } else {                                                        \
+      if (world_size_ == 2) {                                       \
+        KL(ngpus, cross_device_reduce_1stage);                      \
+      } else if (fully_connected_) {                                \
+        if (custom_ar_use_one_shot(bytes, world_size_, is_sm80_)) { \
+          KL(ngpus, cross_device_reduce_1stage);                    \
+        } else {                                                    \
+          KL(ngpus, cross_device_reduce_2stage);                    \
+        }                                                           \
+      }                                                             \
+    }                                                               \
+    break;                                                          \
   }
 
     switch (world_size_) {

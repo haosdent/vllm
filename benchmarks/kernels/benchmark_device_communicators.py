@@ -193,6 +193,17 @@ class CommunicatorBenchmark:
 
         if self.custom_allreduce is not None:
             comm = self.custom_allreduce
+            # CustomAllreduce automatic policy
+            communicators.append(
+                (
+                    "ca_auto",
+                    lambda t, c=comm: c.custom_all_reduce(t),
+                    lambda t, c=comm: c.should_custom_ar(t),
+                    comm.capture(),
+                    {},
+                    None,  # no destroy function
+                )
+            )
             # CustomAllreduce one-shot
             communicators.append(
                 (
