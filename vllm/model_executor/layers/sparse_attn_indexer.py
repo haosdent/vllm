@@ -632,9 +632,9 @@ def sparse_attn_indexer(
             )
         else:
             # SM80/SM121 Triton fallback. Downstream topk reads only up to
-            # `seq_lens`, so size the buffer to the active batch max rather
-            # than the configured model max.
-            active_max_model_len = attn_metadata_narrowed.max_seq_len
+            # `seq_lens`, so size the buffer in the same compressed indexer
+            # coordinate system.
+            active_max_model_len = decode_metadata.max_seq_len
             logits = fp8_paged_mqa_logits_triton(
                 padded_q_quant_cast,
                 kv_cache,

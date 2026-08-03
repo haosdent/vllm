@@ -414,6 +414,8 @@ class DeepSeekV32IndexerDecodeMetadata:
     #   - native MTP path: 2D (B, next_n) where [b,j] = L_b - next_n + j + 1
     # Both fp8_fp4_paged_mqa_logits and the topk kernels accept both shapes.
     seq_lens: torch.Tensor
+    # Upper bound in the same indexer-cache coordinate system as seq_lens.
+    max_seq_len: int
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
@@ -957,6 +959,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
+                max_seq_len=(common_attn_metadata.max_seq_len // self.compress_ratio),
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,

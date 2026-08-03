@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.v1.attention.utils import create_vllm_config
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     BuildPrefillChunkMetadataKernel,
@@ -14,6 +13,26 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.block_table import get_block_table_width
+
+
+def _make_indexer_test_config(
+    max_model_len: int, max_num_batched_tokens: int = 8
+) -> SimpleNamespace:
+    """Minimal builder config without model-registry/native-extension imports."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=8,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=None,
+        attention_config=SimpleNamespace(use_fp4_indexer_cache=False),
+    )
 
 
 def test_indexer_warmup_normalizes_zero_compress_ratios():
@@ -48,7 +67,9 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         dtype=torch.bfloat16,
         compress_ratio=4,
     )
-    vllm_config = create_vllm_config(max_model_len=1024)
+    vllm_config = _make_indexer_test_config(
+        max_model_len=1024, max_num_batched_tokens=40
+    )
     max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, 1024)
     block_table_width = get_block_table_width(max_num_blocks, kv_cache_spec.block_size)
     builder = DeepseekV32IndexerMetadataBuilder(
@@ -116,3 +137,77 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         device=device,
     )
     torch.testing.assert_close(valid_slots, expected)
+
+
+@pytest.mark.parametrize(
+    (
+        "compress_ratio",
+        "seq_len",
+        "max_seq_len",
+        "expected_compressed_len",
+        "expected_compressed_max",
+    ),
+    [
+        (1, 1031, 1031, 1031, 1031),
+        (4, 1031, 1031, 257, 257),
+        (128, 131071, 131071, 1023, 1023),
+        (4, 131072, 262400, 32768, 65600),
+        (128, 131072, 262400, 1024, 2050),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_indexer_decode_max_seq_len_matches_compressed_lengths(
+    compress_ratio: int,
+    seq_len: int,
+    max_seq_len: int,
+    expected_compressed_len: int,
+    expected_compressed_max: int,
+):
+    """Decode bounds and lengths must use compressed cache coordinates."""
+    device = torch.device("cuda")
+    kv_cache_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        compress_ratio=compress_ratio,
+    )
+    # Keep this metadata regression independent of model-registry subprocesses
+    # and compiled attention extensions. The builder only needs these fields.
+    vllm_config = _make_indexer_test_config(max_model_len=max_seq_len)
+    max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, max_seq_len)
+    block_table_width = get_block_table_width(max_num_blocks, kv_cache_spec.block_size)
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy"],
+        vllm_config=vllm_config,
+        device=device,
+        block_table_width=block_table_width,
+    )
+
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
+    original_seq_lens = seq_lens.clone()
+    common = CommonAttentionMetadata(
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        seq_lens=seq_lens,
+        seq_lens_cpu_upper_bound=seq_lens.cpu(),
+        num_reqs=1,
+        num_actual_tokens=1,
+        max_query_len=1,
+        max_seq_len=max_seq_len,
+        block_table_tensor=torch.zeros(
+            (1, block_table_width), dtype=torch.int32, device=device
+        ),
+        slot_mapping=torch.zeros(1, dtype=torch.int64, device=device),
+        causal=True,
+    )
+
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert metadata.max_seq_len == max_seq_len
+    assert metadata.decode is not None
+    assert metadata.decode.max_seq_len == expected_compressed_max
+    assert metadata.decode.seq_lens.item() == expected_compressed_len
+    torch.testing.assert_close(seq_lens, original_seq_lens)
