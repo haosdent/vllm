@@ -19,7 +19,6 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.dsv4_sparse_decode_launch import (
     SparseDecodeDispatch,
     SparseDecodeLaunchConfig,
-    SparseDecodeShape,
     classify_sparse_decode_dispatch,
     get_sm80_sparse_decode_launch,
     legacy_sparse_decode_num_splits,
@@ -2181,14 +2180,14 @@ def _rocm_sparse_attn_decode_ragged_triton(
         decode_dispatch is SparseDecodeDispatch.SM80_SPLIT_K
         and sm80_measured_decode_launch_enabled
     ):
-        shape = SparseDecodeShape(
+        launch_config = get_sm80_sparse_decode_launch(
             num_queries=num_queries,
             num_heads=num_heads,
             avg_main_len=avg_main_len,
             avg_extra_len=avg_extra_len,
             sm_count=_decode_cu_count(),
+            fallback=launch_config,
         )
-        launch_config = get_sm80_sparse_decode_launch(shape, fallback=launch_config)
 
     block_h = launch_config.block_h
     block_k = launch_config.block_k
