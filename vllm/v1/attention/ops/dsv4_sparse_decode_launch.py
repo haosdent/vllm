@@ -298,23 +298,11 @@ def estimate_sm80_sparse_decode_launch(
     )
 
 
-# Exact A100-SXM4-80GB (108 SM) entries accepted by a seven-repeat interleaved
-# A/B confirmation after a full canonical sweep.  Every repeat passed the
-# numerical contract and each entry cleared the 5% paired-median margin and 2%
-# per-arm CV gates.  Unlisted shapes deliberately retain the safe launch.
-# Evidence SHA256: db84e76bac48693a784802a3f6e3e5d85842cf4bfa5a3f90edf1eb3a000a0c95
+# Exact A100-SXM4-80GB (108 SM) entries that beat the production wrapper's
+# deployed fallback. Unlisted shapes deliberately retain the safe launch.
 SM80_MEASURED_LAUNCHES: Mapping[
     tuple[int, int, int, int, int], SparseDecodeLaunchConfig
 ] = {
-    (1, 8, 128, 512, 108): SparseDecodeLaunchConfig(
-        block_h=4, block_k=32, num_splits=20, num_warps=8
-    ),
-    (8, 8, 128, 512, 108): SparseDecodeLaunchConfig(
-        block_h=8, block_k=32, num_splits=10, num_warps=8
-    ),
-    (32, 8, 128, 512, 108): SparseDecodeLaunchConfig(
-        block_h=8, block_k=32, num_splits=6, num_warps=4
-    ),
     (64, 8, 128, 512, 108): SparseDecodeLaunchConfig(
         block_h=8, block_k=32, num_splits=3, num_warps=4
     ),
