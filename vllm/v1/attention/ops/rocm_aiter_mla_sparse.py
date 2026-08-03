@@ -16,6 +16,15 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.dsv4_sparse_decode_launch import (
+    SparseDecodeDispatch,
+    SparseDecodeLaunchConfig,
+    SparseDecodeShape,
+    classify_sparse_decode_dispatch,
+    get_sm80_sparse_decode_launch,
+    legacy_sparse_decode_num_splits,
+    sparse_decode_partial_iters,
+)
 from vllm.v1.attention.ops.fp8_sm80 import (
     _decode_fp8_lut,
     get_e4m3fn_bf16_lut,
@@ -1110,6 +1119,29 @@ def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.int32).contiguous()
 
 
+def sm80_measured_decode_lengths_are_full(
+    seq_lens_cpu_upper_bound: torch.Tensor | None,
+    num_decodes: int,
+    max_query_len: int,
+) -> bool:
+    """Prove every target SM80 decode row fills SWA=128 and C4 top-k=512."""
+    if (
+        seq_lens_cpu_upper_bound is None
+        or seq_lens_cpu_upper_bound.device.type != "cpu"
+        or num_decodes <= 0
+        or seq_lens_cpu_upper_bound.numel() < num_decodes
+        or max_query_len <= 0
+    ):
+        return False
+
+    # The CPU bound can lead device seq_lens by at most one scheduled query.
+    # Subtract that query once for rejection and once to reach its earliest
+    # token. A batch minimum keeps this proof to one CPU reduction.
+    min_seq_len_upper_bound = int(seq_lens_cpu_upper_bound[:num_decodes].min().item())
+    earliest_context_lower_bound = min_seq_len_upper_bound - 2 * max_query_len + 1
+    return earliest_context_lower_bound >= 4 * 512
+
+
 @triton.jit
 def _sparse_attn_prefill_ragged_kernel(
     q_ptr,
@@ -1896,11 +1928,32 @@ def _rocm_sparse_attn_prefill_triton(
 
 
 @functools.lru_cache
-def _use_split_k_decode() -> bool:
-    """Return whether decode should use the low-batch split-K path."""
+def _sparse_decode_dispatch() -> SparseDecodeDispatch:
+    """Resolve the architecture route once per worker process."""
+
+    cuda_capability = None
     if current_platform.is_cuda():
-        return True
-    return _ON_GFX942 or _ON_GFX950
+        try:
+            capability = current_platform.get_device_capability()
+            if capability is not None:
+                cuda_capability = capability.to_int()
+        except Exception:
+            # Preserve the pre-policy behavior: unknown CUDA devices still use
+            # the split-K path, just without the SM80-specific launch policy.
+            pass
+    return classify_sparse_decode_dispatch(
+        is_cuda=current_platform.is_cuda(),
+        cuda_capability=cuda_capability,
+        on_gfx942=_ON_GFX942,
+        on_gfx950=_ON_GFX950,
+    )
+
+
+@functools.lru_cache
+def _use_split_k_decode() -> bool:
+    """Whether decode takes a split-K path instead of the single-pass one."""
+
+    return _sparse_decode_dispatch() is not SparseDecodeDispatch.SINGLE_PASS
 
 
 @functools.lru_cache
@@ -1919,15 +1972,7 @@ def _decode_partial_iters(
     Each split processes ``ceil(seg_len / splits)`` tokens of a segment, walked
     ``BLOCK_K`` at a time, and the main/extra segments are handled separately.
     """
-    main_iters = (
-        math.ceil(math.ceil(avg_main_len / splits) / block_k) if avg_main_len > 0 else 0
-    )
-    extra_iters = (
-        math.ceil(math.ceil(avg_extra_len / splits) / block_k)
-        if avg_extra_len > 0
-        else 0
-    )
-    return main_iters + extra_iters
+    return sparse_decode_partial_iters(avg_main_len, avg_extra_len, splits, block_k)
 
 
 def _decode_num_splits(
@@ -1967,35 +2012,14 @@ def _decode_num_splits(
     in one wave, so s8 is strictly better). Snapping needs the average segment
     lengths, which the caller derives sync-free from the ragged index sizes.
     """
-    base = max(1, num_queries * heads_blocks)
-    # Target ~1 workgroup per CU: enough to fill the device while keeping the
-    # reduce cost (which grows with split count) small. Tuned on gfx950.
-    cu = max(1, _decode_cu_count())
-    # Per-wave overhead penalty: higher values discourage split counts that
-    # spill into extra GPU waves. Tuned on gfx950.
-    mu = 0.04
-    best_splits = 1
-    best_cost = None
-    # Search up to 16 splits; beyond that the reduce/HBM overhead dominates.
-    for splits in range(1, 17):
-        waves = (base * splits + cu - 1) // cu
-        cost = waves * (1.0 / splits + mu)
-        if best_cost is None or cost < best_cost - 1e-9:
-            best_splits = splits
-            best_cost = cost
-
-    if best_splits > 1 and (avg_main_len > 0 or avg_extra_len > 0):
-        target_waves = (base * best_splits + cu - 1) // cu
-        target_iters = _decode_partial_iters(
-            avg_main_len, avg_extra_len, best_splits, block_k
-        )
-        for splits in range(1, best_splits):
-            waves = (base * splits + cu - 1) // cu
-            iters = _decode_partial_iters(avg_main_len, avg_extra_len, splits, block_k)
-            if waves == target_waves and iters == target_iters:
-                best_splits = splits
-                break
-    return best_splits
+    return legacy_sparse_decode_num_splits(
+        num_queries=num_queries,
+        heads_blocks=heads_blocks,
+        avg_main_len=avg_main_len,
+        avg_extra_len=avg_extra_len,
+        block_k=block_k,
+        sm_count=_decode_cu_count(),
+    )
 
 
 def _rocm_sparse_attn_decode_ragged_triton(
@@ -2010,6 +2034,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
+    sm80_measured_decode_lengths_are_full: bool = False,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert main_cache.ndim == 3, (
@@ -2079,8 +2104,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
     # Cached 512-byte table; ignored at compile time where native FP8
     # conversion is supported.
     fp8_lut = get_e4m3fn_bf16_lut(q.device)
+    decode_dispatch = _sparse_decode_dispatch()
 
-    if not _use_split_k_decode():  # Single-pass fallback for un-tuned archs.
+    if decode_dispatch is SparseDecodeDispatch.SINGLE_PASS:
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
@@ -2118,16 +2144,40 @@ def _rocm_sparse_attn_decode_ragged_triton(
         )
         return out
 
-    block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.
+    # Keep the deployed block width for the legacy path and SM80 fallback.
+    block_k = 32
     # Average per-query segment lengths, read sync-free from the ragged index
     # sizes, let the split heuristic avoid over-splitting
     # main_indices/extra_indices are flat [nnz] int32.
     inv_q = 1.0 / max(1, num_queries)
     avg_main_len = main_indices.numel() * inv_q
     avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
-    num_splits = _decode_num_splits(
+    fallback_num_splits = _decode_num_splits(
         num_queries, heads_blocks, avg_main_len, avg_extra_len, block_k
     )
+    launch_config = SparseDecodeLaunchConfig(
+        block_h=block_h,
+        block_k=block_k,
+        num_splits=fallback_num_splits,
+        num_warps=8,
+    )
+    if (
+        decode_dispatch is SparseDecodeDispatch.SM80_SPLIT_K
+        and sm80_measured_decode_lengths_are_full
+    ):
+        shape = SparseDecodeShape(
+            num_queries=num_queries,
+            num_heads=num_heads,
+            avg_main_len=avg_main_len,
+            avg_extra_len=avg_extra_len,
+            sm_count=_decode_cu_count(),
+        )
+        launch_config = get_sm80_sparse_decode_launch(shape, fallback=launch_config)
+
+    block_h = launch_config.block_h
+    block_k = launch_config.block_k
+    num_splits = launch_config.num_splits
+    heads_blocks = triton.cdiv(num_heads, block_h)
 
     part_m = torch.empty(
         (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
@@ -2179,8 +2229,10 @@ def _rocm_sparse_attn_decode_ragged_triton(
         BLOCK_H=block_h,
         BLOCK_K=block_k,
         NUM_SPLITS=num_splits,
-        NUM_STAGES=1,
-        num_warps=4,
+        NUM_STAGES=launch_config.num_stages,
+        # The safe policy keeps 8 warps: [BLOCK_H, 512] fp32 accumulators spill
+        # ~1.7 KB/thread at 4 warps. A measured SM80 table may override it.
+        num_warps=launch_config.num_warps,
     )
 
     _sparse_attn_decode_reduce_kernel[(num_queries, num_heads)](
@@ -2223,6 +2275,7 @@ def _rocm_sparse_attn_decode_triton(
     main_ragged_indptr: torch.Tensor | None = None,
     extra_ragged_indices: torch.Tensor | None = None,
     extra_ragged_indptr: torch.Tensor | None = None,
+    sm80_measured_decode_lengths_are_full: bool = False,
 ) -> torch.Tensor:
     if main_ragged_indices is None or main_ragged_indptr is None:
         main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
@@ -2258,6 +2311,7 @@ def _rocm_sparse_attn_decode_triton(
         extra_cache=extra_cache,
         extra_indices=extra_ragged_indices,
         extra_indptr=extra_ragged_indptr,
+        sm80_measured_decode_lengths_are_full=(sm80_measured_decode_lengths_are_full),
     )
 
 
@@ -2329,6 +2383,7 @@ def rocm_sparse_attn_decode(
     nope_head_dim: int,
     rope_head_dim: int,
     output: torch.Tensor,
+    sm80_measured_decode_lengths_are_full: bool = False,
 ) -> None:
     assert swa_k_cache.dtype == torch.uint8, (
         "ROCm Triton sparse decode expects uint8 fp8_ds_mla SWA cache, "
@@ -2374,5 +2429,6 @@ def rocm_sparse_attn_decode(
         main_ragged_indptr=swa_ragged_indptr,
         extra_ragged_indices=topk_ragged_indices,
         extra_ragged_indptr=topk_ragged_indptr,
+        sm80_measured_decode_lengths_are_full=(sm80_measured_decode_lengths_are_full),
     )
     output.copy_(attn_out.to(output.dtype))
