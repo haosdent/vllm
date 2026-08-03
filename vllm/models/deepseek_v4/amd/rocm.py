@@ -6,6 +6,7 @@ from typing import cast
 
 import torch
 
+from vllm.config import CUDAGraphMode
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -32,6 +33,8 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_inv_rope_einsum,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
+    sm80_measured_decode_launch_enabled,
+    sm80_measured_decode_lengths_are_full,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -312,6 +315,7 @@ class DeepseekV4ROCMAiterMLASparseMetadata(DeepseekV4FlashMLAMetadata):
 class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
     decode_swa_ragged_indices: torch.Tensor | None = None
     decode_swa_ragged_indptr: torch.Tensor | None = None
+    sm80_measured_decode_launch_enabled: bool = False
 
 
 class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuilder):
@@ -374,6 +378,26 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
 class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        hf_config = self.vllm_config.model_config.hf_config
+        compress_ratios = getattr(hf_config, "compress_ratios", None) or ()
+        try:
+            is_exact_sm80 = (
+                current_platform.is_cuda() and current_platform.is_device_capability(80)
+            )
+        except Exception:
+            is_exact_sm80 = False
+        self._can_use_sm80_measured_decode = (
+            is_exact_sm80
+            and self.window_size == 128
+            and hf_config.index_topk == 512
+            and 4 in compress_ratios
+            and self.num_speculative_tokens == 0
+        )
+        cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
+        self._full_decode_cudagraph_enabled = (
+            cudagraph_mode is not None
+            and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        )
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         # The non-causal (DSpark draft) path widens each token's SWA index list
         # to ``noncausal_index_width`` (>= window_size), so size the persistent
@@ -424,10 +448,32 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
                 base.decode_swa_indices.shape[-1],
             )
 
+        full_lengths = False
+        if (
+            self._can_use_sm80_measured_decode
+            and common_attn_metadata.causal is True
+            and base.num_decodes > 0
+        ):
+            full_lengths = sm80_measured_decode_lengths_are_full(
+                common_attn_metadata.seq_lens_cpu_upper_bound,
+                base.num_decodes,
+                common_attn_metadata.max_query_len,
+            )
+        measured_launch_enabled = sm80_measured_decode_launch_enabled(
+            can_use_measured_decode=self._can_use_sm80_measured_decode,
+            causal=common_attn_metadata.causal is True,
+            num_decodes=base.num_decodes,
+            lengths_are_full=full_lengths,
+            full_decode_cudagraph=(
+                self._full_decode_cudagraph_enabled and base.num_prefills == 0
+            ),
+        )
+
         return DeepseekV4ROCMAiterSparseSWAMetadata(
             **vars(base),
             decode_swa_ragged_indices=ragged_indices,
             decode_swa_ragged_indptr=ragged_indptr,
+            sm80_measured_decode_launch_enabled=measured_launch_enabled,
         )
 
 
@@ -662,6 +708,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             nope_head_dim=self.nope_head_dim,
             rope_head_dim=self.rope_head_dim,
             output=output,
+            sm80_measured_decode_launch_enabled=(
+                self.compress_ratio == 4
+                and swa_metadata.sm80_measured_decode_launch_enabled
+            ),
         )
 
     def _forward_prefill(
