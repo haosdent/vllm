@@ -4,7 +4,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm.utils.import_utils import PlaceholderModule, _has_module
+from vllm.utils.import_utils import (
+    PlaceholderModule,
+    _has_module,
+    is_cutedsl_supported,
+)
 
 
 def _raises_module_not_found():
@@ -101,3 +105,24 @@ class TestHasModule:
             result = _has_module("json")  # should hit cache
             mock_spec.assert_not_called()
             assert result is True
+
+
+class TestIsCutedslSupported:
+    def setup_method(self):
+        is_cutedsl_supported.cache_clear()
+
+    @pytest.mark.parametrize(
+        ("installed", "sm90_or_newer", "expected"),
+        [(False, False, False), (True, False, False), (True, True, True)],
+    )
+    def test_requires_package_and_sm90(
+        self, installed: bool, sm90_or_newer: bool, expected: bool
+    ) -> None:
+        with (
+            patch("vllm.utils.import_utils.has_cutedsl", return_value=installed),
+            patch(
+                "vllm.platforms.current_platform.has_device_capability",
+                return_value=sm90_or_newer,
+            ),
+        ):
+            assert is_cutedsl_supported() is expected
