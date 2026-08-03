@@ -233,6 +233,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB: int | None = None
+    VLLM_MAX_SIZE_MB_CUSTOM_ALL_REDUCE: int | None = None
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
@@ -1318,6 +1319,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If unset, use the built-in threshold table.
     "VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB": lambda: maybe_convert_int(
         os.environ.get("VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB", None)
+    ),
+    # Exclusive upper payload bound (MiB) for custom allreduce. A payload equal
+    # to or above the configured value falls back to NCCL. Unset preserves the
+    # built-in 8 MiB limit. Raising the limit to 32 MiB grows the default
+    # communicator's IPC-registered allocations by about 40 MiB per rank
+    # (24 MiB metadata-buffer growth plus 16 MiB legacy-buffer growth).
+    "VLLM_MAX_SIZE_MB_CUSTOM_ALL_REDUCE": lambda: maybe_convert_int(
+        os.environ.get("VLLM_MAX_SIZE_MB_CUSTOM_ALL_REDUCE", None)
     ),
     # Controls the minimum tensor size (KB, where 1 KB = 1024 bytes) required
     # to use the configured QuickReduce codec. Smaller tensors use FP
