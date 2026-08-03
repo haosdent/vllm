@@ -317,19 +317,52 @@ def test_compute_global_topk_ragged_indices_and_indptr() -> None:
     torch.testing.assert_close(actual_lens, expected_lens)
 
 
+@pytest.mark.parametrize(
+    "properties,expected",
+    [
+        (
+            SimpleNamespace(major=8, minor=0, shared_memory_per_block_optin=166912),
+            (8, 32),
+        ),
+        (
+            SimpleNamespace(major=8, minor=0, shared_memory_per_block_optin=65536),
+            (8, 16),
+        ),
+        (
+            SimpleNamespace(major=8, minor=6, shared_memory_per_block_optin=166912),
+            (16, 16),
+        ),
+    ],
+)
+def test_sparse_attn_prefill_block_shape_scope(monkeypatch, properties, expected):
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    monkeypatch.setattr(mod.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: properties)
+    mod._prefill_block_shape.cache_clear()
+    try:
+        assert mod._prefill_block_shape(5, HEAD_DIM, torch.device("cuda:0")) == expected
+    finally:
+        mod._prefill_block_shape.cache_clear()
+
+
 @torch.inference_mode()
-def test_sparse_attn_prefill_ragged_kernel() -> None:
+@pytest.mark.parametrize("num_heads", [5, 8, 16])
+def test_sparse_attn_prefill_ragged_kernel(num_heads: int) -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         _rocm_sparse_attn_prefill_ragged_triton,
     )
 
     device = torch.device("cuda")
     torch.manual_seed(0)
-    q = torch.randn(3, 3, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
-    kv = torch.randn(5, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
-    indices = torch.tensor([0, 2, 1, 3, 4], dtype=torch.int32, device=device)
-    indptr = torch.tensor([0, 2, 5, 5], dtype=torch.int32, device=device)
-    attn_sink = torch.tensor([-0.25, 0.0, 0.25], dtype=torch.float32, device=device)
+    q = torch.randn(3, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    kv = torch.randn(35, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    rows = [list(range(33)), [1, 3, 17], []]
+    indices = torch.tensor(sum(rows, []), dtype=torch.int32, device=device)
+    indptr = torch.tensor([0, 33, 36, 36], dtype=torch.int32, device=device)
+    attn_sink = torch.linspace(
+        -0.25, 0.25, num_heads, dtype=torch.float32, device=device
+    )
     scale = HEAD_DIM**-0.5
 
     actual = _rocm_sparse_attn_prefill_ragged_triton(
@@ -342,9 +375,41 @@ def test_sparse_attn_prefill_ragged_kernel() -> None:
         nope_head_dim=NOPE_HEAD_DIM,
         rope_head_dim=ROPE_HEAD_DIM,
     )
-    expected = _ref_sparse_prefill_ragged(
-        q, kv, [[0, 2], [1, 3, 4], []], scale, attn_sink
+    expected = _ref_sparse_prefill_ragged(q, kv, rows, scale, attn_sink)
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
+def test_sparse_attn_prefill_ragged_realistic_topk_row() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_prefill_ragged_triton,
     )
+
+    device = torch.device("cuda")
+    torch.manual_seed(1)
+    num_heads = 8
+    row = list(range(2049))
+    q = torch.randn(1, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    kv = torch.randn(2049, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    indices = torch.arange(2049, dtype=torch.int32, device=device)
+    indptr = torch.tensor([0, 2049], dtype=torch.int32, device=device)
+    attn_sink = torch.linspace(
+        -0.25, 0.25, num_heads, dtype=torch.float32, device=device
+    )
+    scale = HEAD_DIM**-0.5
+
+    actual = _rocm_sparse_attn_prefill_ragged_triton(
+        q=q,
+        kv=kv,
+        indices=indices,
+        indptr=indptr,
+        scale=scale,
+        attn_sink=attn_sink,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+    )
+    expected = _ref_sparse_prefill_ragged(q, kv, [row], scale, attn_sink)
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
