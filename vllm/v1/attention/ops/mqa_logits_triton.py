@@ -2,10 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton fallback for DeepGEMM's fp8_mqa_logits / fp8_paged_mqa_logits."""
 
+import functools
+
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
+
+_IS_SM80 = current_platform.is_cuda() and current_platform.get_device_capability() == (
+    8,
+    0,
+)
 
 # Paged decode: num_warps=4 dominated on A100/SM80 across {2,4,8}; the others
 # were 1.5–1.7× slower at (num_heads=32, head_dim=128, block_size=64), so
@@ -18,9 +26,24 @@ _PAGED_AUTOTUNE_CONFIGS = [
 # swept (M 1..2048, N 2048..131072) -- BN=64 is 1.25-1.40x worse, BN=32 up to
 # 2.41x. The autotune key is (num_heads, head_dim), both fixed for a model,
 # so a wider sweep cannot adapt per request; it only adds cold-cache JIT.
+# On A100 at the DSv4 H=64, D=128 shape, maxnreg=128 raises residency from
+# three to four CTAs/SM and measured 7.7-8.5% faster. Other fallback devices
+# keep Triton's default register policy.
 _PREFILL_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=ns) for ns in (2, 4)
+    triton.Config(
+        {"BLOCK_N": 128},
+        num_warps=4,
+        num_stages=ns,
+        maxnreg=128 if _IS_SM80 else None,
+    )
+    for ns in (2, 4)
 ]
+
+# Grouping eight KV tiles reuses each query and weight load. It is profitable
+# only for large A100 prefill grids; smaller grids keep the original kernel.
+_KV_GROUP = 8
+_KV_GROUP_MIN_M = 512
+_KV_GROUP_MIN_N = 16384
 
 # Warmup shape mirrors the chunked-prefill regime (small M, long N) so
 # autotune picks a tile sized for real serving rather than a launch-overhead-
@@ -281,68 +304,129 @@ def _fp8_mqa_logits_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_GROUP: tl.constexpr,
 ):
     # bf16 q/k inputs: the wrapper pre-decodes FP8 → bf16. At compute-bound
     # prefill this is ~2× the in-kernel LUT (LUT lookups contend with the
     # matmul for ALU/regs). Paged-decode keeps the LUT path.
     m = tl.program_id(0)
-    n_block = tl.program_id(1)
-
-    n_start = n_block * BLOCK_N
-    offs_n = n_start + tl.arange(0, BLOCK_N)
-    mask_n = offs_n < N
-    # Early-exit when this row's `[ks, ke)` range doesn't overlap the tile.
-    # Chunked prefill produces many such all-masked tiles per row.
     ks = tl.load(ks_ptr + m)
     ke = tl.load(ke_ptr + m)
-    if (n_start >= ke) | (n_start + BLOCK_N <= ks):
-        # When `clean_logits=False` the caller skipped the -inf pre-fill, so
-        # write -inf here for the early-exit tile.
+
+    if KV_GROUP == 1:
+        # Keep the original single-tile program for every non-grouped shape.
+        # Expressing it as a one-iteration static loop regresses that path.
+        n_start = tl.program_id(1) * BLOCK_N
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+        if (n_start >= ke) | (n_start + BLOCK_N <= ks):
+            tl.store(
+                logits_ptr + m * stride_l_m + offs_n * stride_l_n,
+                tl.full([BLOCK_N], float("-inf"), dtype=tl.float32),
+                mask=mask_n,
+            )
+            return
+
+        offs_h = tl.arange(0, BLOCK_H)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_h = offs_h < num_heads
+        mask_d = offs_d < head_dim
+        q = tl.load(
+            q_ptr
+            + m * stride_q_m
+            + offs_h[:, None] * stride_q_h
+            + offs_d[None, :] * stride_q_d,
+            mask=mask_h[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        k = tl.load(
+            k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :] * stride_k_d,
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        k_scale = tl.load(k_scale_ptr + offs_n, mask=mask_n, other=0.0)
+        s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
+        w = tl.load(
+            weights_ptr + m * stride_w_m + offs_h * stride_w_h,
+            mask=mask_h,
+            other=0.0,
+        )
+        s = tl.where(s > 0, s, 0.0) * w[:, None]
+        out = tl.sum(s, axis=0)
+        out = tl.where((offs_n >= ks) & (offs_n < ke), out, float("-inf"))
         tl.store(
             logits_ptr + m * stride_l_m + offs_n * stride_l_n,
-            tl.full([BLOCK_N], float("-inf"), dtype=tl.float32),
+            out,
             mask=mask_n,
         )
-        return
+    else:
+        # Each grouped CTA owns consecutive KV tiles for one query row.
+        group_start = tl.program_id(1) * (KV_GROUP * BLOCK_N)
+        if (group_start >= ke) | (group_start + KV_GROUP * BLOCK_N <= ks):
+            offs_span = group_start + tl.arange(0, BLOCK_N)
+            for _ in tl.static_range(KV_GROUP):
+                tl.store(
+                    logits_ptr + m * stride_l_m + offs_span * stride_l_n,
+                    tl.full([BLOCK_N], float("-inf"), dtype=tl.float32),
+                    mask=offs_span < N,
+                )
+                offs_span += BLOCK_N
+            return
 
-    offs_h = tl.arange(0, BLOCK_H)
-    offs_d = tl.arange(0, BLOCK_D)
-    mask_h = offs_h < num_heads
-    mask_d = offs_d < head_dim
+        offs_h = tl.arange(0, BLOCK_H)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_h = offs_h < num_heads
+        mask_d = offs_d < head_dim
+        q = tl.load(
+            q_ptr
+            + m * stride_q_m
+            + offs_h[:, None] * stride_q_h
+            + offs_d[None, :] * stride_q_d,
+            mask=mask_h[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        w = tl.load(
+            weights_ptr + m * stride_w_m + offs_h * stride_w_h,
+            mask=mask_h,
+            other=0.0,
+        )
 
-    q = tl.load(
-        q_ptr
-        + m * stride_q_m
-        + offs_h[:, None] * stride_q_h
-        + offs_d[None, :] * stride_q_d,
-        mask=mask_h[:, None] & mask_d[None, :],
-        other=0.0,
-    )
+        # The per-tile branch prevents Triton from pipelining all K tiles and
+        # exceeding the A100 register budget.
+        for g in tl.static_range(KV_GROUP):
+            n_start = group_start + g * BLOCK_N
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < N
+            if (n_start >= ke) | (n_start + BLOCK_N <= ks):
+                tl.store(
+                    logits_ptr + m * stride_l_m + offs_n * stride_l_n,
+                    tl.full([BLOCK_N], float("-inf"), dtype=tl.float32),
+                    mask=mask_n,
+                )
+            else:
+                k = tl.load(
+                    k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :] * stride_k_d,
+                    mask=mask_n[:, None] & mask_d[None, :],
+                    other=0.0,
+                )
+                k_scale = tl.load(k_scale_ptr + offs_n, mask=mask_n, other=0.0)
+                s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
 
-    k = tl.load(
-        k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :] * stride_k_d,
-        mask=mask_n[:, None] & mask_d[None, :],
-        other=0.0,
-    )
-    k_scale = tl.load(k_scale_ptr + offs_n, mask=mask_n, other=0.0)
-    s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
+                s = tl.where(s > 0, s, 0.0) * w[:, None]
+                out = tl.sum(s, axis=0)
+                out = tl.where((offs_n >= ks) & (offs_n < ke), out, float("-inf"))
 
-    w = tl.load(
-        weights_ptr + m * stride_w_m + offs_h * stride_w_h,
-        mask=mask_h,
-        other=0.0,
-    )
-    s = tl.where(s > 0, s, 0.0) * w[:, None]
-    out = tl.sum(s, axis=0)
+                tl.store(
+                    logits_ptr + m * stride_l_m + offs_n * stride_l_n,
+                    out,
+                    mask=mask_n,
+                )
 
-    # Store mask below covers mask_n; -inf masks the [ks, ke) range only.
-    out = tl.where((offs_n >= ks) & (offs_n < ke), out, float("-inf"))
 
-    tl.store(
-        logits_ptr + m * stride_l_m + offs_n * stride_l_n,
-        out,
-        mask=mask_n,
-    )
+def _select_prefill_kv_group(m: int, n: int) -> int:
+    if _IS_SM80 and m >= _KV_GROUP_MIN_M and n >= _KV_GROUP_MIN_N:
+        return _KV_GROUP
+    return 1
 
 
 def fp8_mqa_logits_triton(
@@ -366,6 +450,24 @@ def fp8_mqa_logits_triton(
     Returns:
         logits:       [M, N] float32
     """
+    return _fp8_mqa_logits_triton_impl(
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        _select_prefill_kv_group(q.shape[0], kv[0].shape[0]),
+    )
+
+
+def _fp8_mqa_logits_triton_impl(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    kv_group: int,
+) -> torch.Tensor:
     k_fp8, k_scales = kv
     k_scales = k_scales.reshape(-1)
 
@@ -384,8 +486,11 @@ def fp8_mqa_logits_triton(
     q_bf16 = q.to(torch.bfloat16)
     k_bf16 = k_fp8.to(torch.bfloat16)
 
-    # Grid depends on the autotuned BLOCK_N.
-    grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa: E731
+    # Grid depends on the autotuned BLOCK_N and the N-selected KV_GROUP.
+    grid = lambda meta: (  # noqa: E731
+        M,
+        triton.cdiv(N, meta["BLOCK_N"] * meta["KV_GROUP"]),
+    )
     _fp8_mqa_logits_kernel[grid](
         q_bf16,
         k_bf16,
@@ -408,27 +513,63 @@ def fp8_mqa_logits_triton(
         N=N,
         BLOCK_H=BLOCK_H,
         BLOCK_D=BLOCK_D,
+        KV_GROUP=kv_group,
     )
     return logits
 
 
+@functools.lru_cache
 def warmup_fp8_mqa_logits_triton(
     num_heads: int,
     head_dim: int,
     device: torch.device,
 ) -> None:
-    """Prime the prefill `@triton.autotune` cache so first-call doesn't pay
-    the inline sweep (~5–8 s on A100 SM80). N is a runtime scalar, so one
-    small-M / long-N shape covers all chunk lengths."""
-    m = _PREFILL_WARMUP_M
-    n = _PREFILL_WARMUP_N
+    """Tune the ungrouped kernel, then compile the grouped SM80 specialization.
+
+    The cache makes this model-construction warmup process-idempotent even
+    though every sparse indexer layer requests it.
+    """
+    _warmup_fp8_mqa_logits_shape(
+        num_heads, head_dim, _PREFILL_WARMUP_M, _PREFILL_WARMUP_N, device
+    )
+    if _IS_SM80:
+        _warmup_fp8_mqa_logits_shape(
+            num_heads,
+            head_dim,
+            _PREFILL_WARMUP_M,
+            _KV_GROUP_MIN_N,
+            device,
+            kv_group_override=_KV_GROUP,
+        )
+
+
+def _warmup_fp8_mqa_logits_shape(
+    num_heads: int,
+    head_dim: int,
+    m: int,
+    n: int,
+    device: torch.device,
+    kv_group_override: int | None = None,
+) -> None:
     q = torch.empty(m, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)
     k = torch.empty(n, head_dim, dtype=torch.float8_e4m3fn, device=device)
     scales = torch.zeros(n, dtype=torch.float32, device=device)
     weights = torch.zeros(m, num_heads, dtype=torch.float32, device=device)
     ks = torch.zeros(m, dtype=torch.int32, device=device)
     ke = torch.full((m,), n, dtype=torch.int32, device=device)
-    fp8_mqa_logits_triton(q, (k, scales), weights, ks, ke)
+    kv_group = (
+        _select_prefill_kv_group(m, n)
+        if kv_group_override is None
+        else kv_group_override
+    )
+    _fp8_mqa_logits_triton_impl(
+        q,
+        (k, scales),
+        weights,
+        ks,
+        ke,
+        kv_group,
+    )
 
 
 def warmup_fp8_paged_mqa_logits_triton(

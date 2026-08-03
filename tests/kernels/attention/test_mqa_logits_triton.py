@@ -7,6 +7,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.ops import mqa_logits_triton as mqa_logits_mod
 from vllm.v1.attention.ops.mqa_logits_triton import (
     fp8_mqa_logits_triton,
     fp8_paged_mqa_logits_triton,
@@ -187,6 +188,82 @@ def test_fp8_mqa_logits_triton_matches_torch(
         torch.testing.assert_close(
             out_triton[finite], out_torch[finite], atol=_ATOL, rtol=_RTOL
         )
+
+
+@pytest.mark.parametrize(
+    "is_sm80,M,N,expected",
+    [
+        (True, 511, 16384, 1),
+        (True, 512, 16383, 1),
+        (True, 512, 16384, 8),
+        (False, 512, 16384, 1),
+    ],
+)
+def test_fp8_mqa_logits_group_dispatch_boundaries(monkeypatch, is_sm80, M, N, expected):
+    monkeypatch.setattr(mqa_logits_mod, "_IS_SM80", is_sm80)
+    assert mqa_logits_mod._select_prefill_kv_group(M, N) == expected
+
+
+@pytest.mark.parametrize(
+    "is_sm80,expected_shapes",
+    [
+        (False, [(8, 8192, None)]),
+        (True, [(8, 8192, None), (8, 16384, 8)]),
+    ],
+)
+def test_fp8_mqa_logits_warmup_order_and_cache(monkeypatch, is_sm80, expected_shapes):
+    calls = []
+
+    def record_shape(num_heads, head_dim, m, n, device, kv_group_override=None):
+        calls.append((m, n, kv_group_override))
+
+    monkeypatch.setattr(mqa_logits_mod, "_IS_SM80", is_sm80)
+    monkeypatch.setattr(mqa_logits_mod, "_warmup_fp8_mqa_logits_shape", record_shape)
+    mqa_logits_mod.warmup_fp8_mqa_logits_triton.cache_clear()
+    try:
+        args = (64, 128, torch.device("cuda:0"))
+        mqa_logits_mod.warmup_fp8_mqa_logits_triton(*args)
+        mqa_logits_mod.warmup_fp8_mqa_logits_triton(*args)
+        assert calls == expected_shapes
+    finally:
+        mqa_logits_mod.warmup_fp8_mqa_logits_triton.cache_clear()
+
+
+@pytest.mark.skipif(
+    not mqa_logits_mod._IS_SM80,
+    reason="grouped prefill logits dispatch is restricted to SM80",
+)
+def test_fp8_mqa_logits_grouped_overwrites_high_offset_masked_spans():
+    """Grouped dirty output must overwrite groups and tiles outside [ks, ke)."""
+    M, N, num_heads, head_dim = 512, 16640, 1, 16
+    device = torch.device("cuda")
+    q_fp8 = torch.zeros(
+        M, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device
+    )
+    k_fp8 = torch.zeros(N, head_dim, dtype=torch.float8_e4m3fn, device=device)
+    k_scales = torch.ones(N, dtype=torch.float32, device=device)
+    weights = torch.ones(M, num_heads, dtype=torch.float32, device=device)
+
+    row_offsets = torch.arange(M, dtype=torch.int32, device=device) % 64
+    ks = 8448 + row_offsets
+    ke = 9472 + row_offsets
+
+    out_clean = fp8_mqa_logits_triton(
+        q_fp8, (k_fp8, k_scales), weights, ks, ke, clean_logits=True
+    )
+    out_dirty = fp8_mqa_logits_triton(
+        q_fp8, (k_fp8, k_scales), weights, ks, ke, clean_logits=False
+    )
+    assert torch.equal(out_dirty, out_clean)
+
+    for row in (0, 63, M - 1):
+        start = int(ks[row])
+        end = int(ke[row])
+        assert torch.isneginf(out_dirty[row, :start]).all()
+        assert torch.equal(
+            out_dirty[row, start:end], torch.zeros_like(out_dirty[row, start:end])
+        )
+        assert torch.isneginf(out_dirty[row, end:]).all()
 
 
 def test_fp8_mqa_logits_triton_clean_logits_false_overwrites_masked():
