@@ -8,27 +8,32 @@ import torch
 
 from vllm.platforms import current_platform
 
+# These Triton kernels are also the CUDA SM8x (Ampere) sparse-MLA path, not
+# just ROCm's -- see vllm/models/deepseek_v4/ampere/ampere_sparse.py.
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_rocm(), reason="Only used by ROCm"
+    not (
+        current_platform.is_rocm()
+        or (
+            current_platform.is_cuda()
+            and not current_platform.has_device_capability(90)
+        )
+    ),
+    reason="ROCm or pre-Hopper CUDA only",
 )
 
 
 def _on_split_decode_arch() -> bool:
-    if not current_platform.is_rocm():
-        return False
-    try:
-        from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
+    """Mirrors _use_split_k_decode(): CUDA plus the tuned gfx9 arches."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _use_split_k_decode
 
-        return bool(_ON_GFX942 or _ON_GFX950)
-    except Exception:
-        return False
+    return _use_split_k_decode()
 
 
-# The flash-decode split-K decode path is only tuned for AMD gfx942/gfx950; other
-# architectures take the fallback decode kernel, so its tests are skipped there.
+# Split-K decode runs on CUDA and the tuned AMD gfx942/gfx950 architectures;
+# other architectures take the single-pass fallback.
 requires_split_decode_arch = pytest.mark.skipif(
     not _on_split_decode_arch(),
-    reason="split-K decode kernel is only tuned for AMD gfx942/gfx950",
+    reason="split-K decode path not selected on this arch",
 )
 
 NOPE_HEAD_DIM = 448
@@ -428,11 +433,9 @@ def test_sparse_attn_decode_split_k_kernel(
 ) -> None:
     """Flash-decode split-K decode path (partial + reduce kernels).
 
-    This path is the gfx942/gfx950 production path, so the test only runs on
-    those architectures. The split count is pinned so the partial/reduce kernels are
-    exercised across split counts. ``num_splits=8`` drives splits past the
-    shortest segment length, covering the empty-split edge case handled by the
-    reduce kernel.
+    The split count is pinned so the partial/reduce kernels are exercised across
+    split counts. ``num_splits=8`` drives splits past the shortest segment length,
+    covering the empty-split edge case handled by the reduce kernel.
     """
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
 
@@ -716,3 +719,55 @@ def test_get_cached_wo_a_bf16_fp8_blockscale_caches() -> None:
 
     # Second call returns the same cached object.
     assert _get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim) is out
+
+
+def test_sparse_attn_decode_int32_block_address_overflow() -> None:
+    """Block ids past 2^31 / stride must not wrap the cache addressing.
+
+    stride0 = 64 * 584 = 37376 B, so ids >= ~57.5k overflow int32. Only the
+    tail blocks are populated; a wrapped address reads zeros or faults.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_decode_ragged_triton,
+    )
+
+    torch.manual_seed(3)
+    use_fnuz = current_platform.is_fp8_fnuz()
+    num_blocks, block_size = 58000, 64
+    n_fill, num_q, num_heads = 128, 2, 4
+    base_slot = (num_blocks - 2) * block_size
+
+    # Populate only the last two blocks, addressed past the int32 boundary.
+    kv = torch.zeros(base_slot + n_fill, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    kv[base_slot:] = torch.randn(n_fill, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    cache = _pack_fp8_ds_mla_cache(kv, block_size, use_fnuz=use_fnuz)
+
+    q = torch.randn(num_q, num_heads, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    rows = [
+        (base_slot + torch.randint(0, n_fill, (64,))).tolist() for _ in range(num_q)
+    ]
+    indices, indptr = _ragged_from_rows(rows, q.device)
+    scale = HEAD_DIM**-0.5
+
+    actual = _rocm_sparse_attn_decode_ragged_triton(
+        q=q,
+        main_cache=cache,
+        main_indices=indices,
+        main_indptr=indptr,
+        scale=scale,
+        attn_sink=None,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+    )
+    assert actual.isfinite().all()
+
+    expected = _ref_sparse_decode_ragged(
+        q,
+        cache,
+        rows,
+        scale,
+        None,
+        block_size,
+        main_use_fnuz=use_fnuz,
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)

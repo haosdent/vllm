@@ -31,6 +31,7 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
 )
 from vllm.models.deepseek_v4.compressor import _get_c128_boundary
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import is_cutedsl_supported
 
 from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
 
@@ -582,7 +583,19 @@ def _reference_kv_compress_norm_rope(
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 32])
 @pytest.mark.parametrize("kv_block_size", [16, 32])
-@pytest.mark.parametrize("use_fp4", [False, True])
+@pytest.mark.parametrize(
+    "use_fp4",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not current_platform.has_device_capability(100),
+                reason="MXFP4 indexer cache kernel requires SM100+",
+            ),
+        ),
+    ],
+)
 def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: bool):
     """Fused K compress+norm+rope+quant+insert for the indexer KV cache."""
     HEAD_DIM = 128
@@ -718,6 +731,10 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
             )
 
 
+@pytest.mark.skipif(
+    not is_cutedsl_supported(),
+    reason="CuTe DSL kernels require the package and SM90+",
+)
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 @pytest.mark.parametrize("store_fp8", [False, True])
 def test_cutedsl_full_cache_store(compress_ratio: int, store_fp8: bool):
@@ -726,7 +743,6 @@ def test_cutedsl_full_cache_store(compress_ratio: int, store_fp8: bool):
     Exercises the contiguous bf16 / per-tensor fp8 store branch of both the C4
     fused kernel and the C128 split kernel against the PyTorch reference.
     """
-    cutedsl = pytest.importorskip("cutlass")  # noqa: F841
     from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (
         fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl,
         split_kv_compress_norm_rope_insert_sparse_attn_cutedsl,

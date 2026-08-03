@@ -62,6 +62,7 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
                 self.indexer.max_total_seq_len,
                 topk_indices_buffer,
                 skip_k_cache_insert=True,
+                num_heads=self.indexer.n_head,
             )
         self._fp8_kv = is_quantized_kv_cache(self.kv_cache_dtype)
         self._fp8_kv_needs_view = self._fp8_kv and self.kv_cache_dtype != "fp8_ds_mla"

@@ -98,6 +98,9 @@ def cutedsl_warmup() -> None:
     if not current_platform.is_cuda():
         logger.debug("Skipping CuTeDSL warmup on non-CUDA platform.")
         return
+    if not current_platform.has_device_capability(90):
+        logger.debug("Skipping CuTeDSL warmup on pre-Hopper CUDA device.")
+        return
 
     compile_units = _collect_unique_compile_units(_iter_cutedsl_warmup_compile_units())
     if not compile_units:

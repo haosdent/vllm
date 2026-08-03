@@ -24,8 +24,12 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import (
+    _LAYER_TYPE_C4A,
+    _LAYER_TYPE_C128A,
+    _LAYER_TYPE_SWAONLY,
     DeepseekSparseSWAMetadata,
     DeepseekSparseSWAMetadataBuilder,
+    FlashMLASchedMeta,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_ragged_indices_from_dense,
@@ -372,6 +376,13 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
 
 
 class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
+    def build_tile_scheduler(
+        self, num_decode_tokens: int
+    ) -> dict[str, FlashMLASchedMeta | None]:
+        # The ragged Triton decode never calls FlashMLA, so skip planning
+        # its scheduler metadata entirely.
+        return dict.fromkeys((_LAYER_TYPE_SWAONLY, _LAYER_TYPE_C4A, _LAYER_TYPE_C128A))
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
