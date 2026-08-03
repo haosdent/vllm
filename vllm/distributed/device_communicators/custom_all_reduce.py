@@ -6,6 +6,7 @@ from typing import cast
 
 import torch
 import torch.distributed as dist
+from torch._C._autograd import DeviceType
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
@@ -260,6 +261,13 @@ class CustomAllreduce:
 
     def _init_mnnvl_buffer(self, stage_size: int) -> None:
         if torch_symm_mem is None or not current_platform.is_cuda():
+            return
+        device_index = self.device.index
+        if device_index is None:
+            device_index = torch.accelerator.current_device_index()
+        if not torch_symm_mem._SymmetricMemory.has_multicast_support(
+            DeviceType.CUDA, device_index
+        ):
             return
         try:
             buffer_size = stage_size * 6
