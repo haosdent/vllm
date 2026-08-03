@@ -1833,9 +1833,8 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         "_rocm_sparse_attn_prefill_ragged_triton",
     )
 
-    block_h = 16
+    block_h, block_k = _prefill_block_shape(num_heads, head_dim, q.device)
     block_d = triton.next_power_of_2(head_dim)
-    block_k = 16 if head_dim >= 256 else 32
     num_warps = 4
     out = torch.empty_like(q, dtype=torch.bfloat16)
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
@@ -1901,6 +1900,29 @@ def _use_split_k_decode() -> bool:
     if current_platform.is_cuda():
         return True
     return _ON_GFX942 or _ON_GFX950
+
+
+@functools.lru_cache
+def _prefill_block_shape(
+    num_heads: int, head_dim: int, device: torch.device
+) -> tuple[int, int]:
+    """Select A100 prefill tiles while retaining the legacy fallback."""
+    legacy = (16, 16 if head_dim >= 256 else 32)
+    if not current_platform.is_cuda():
+        return legacy
+    try:
+        properties = torch.cuda.get_device_properties(device)
+    except Exception:
+        return legacy
+    if (properties.major, properties.minor) != (8, 0):
+        return legacy
+
+    block_h = min(16, max(8, triton.next_power_of_2(num_heads)))
+    if head_dim < 256:
+        return block_h, 32
+    # The wide tile uses about 83 KiB of shared memory per CTA.
+    block_k = 32 if properties.shared_memory_per_block_optin >= 96 * 1024 else 16
+    return block_h, block_k
 
 
 @functools.lru_cache
