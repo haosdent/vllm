@@ -655,10 +655,10 @@ def sparse_attn_indexer(
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
         )
-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
-            512,
-            1024,
-            2048,
+        use_persistent_topk = (
+            current_platform.is_cuda()
+            and current_platform.has_device_capability(90)
+            and topk_tokens in (512, 1024, 2048)
         )
         if use_cooperative_topk:
             workspace_manager = current_workspace_manager()

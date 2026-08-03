@@ -7,6 +7,7 @@ Run `pytest tests/kernels/quantization/test_scaled_mm_kernel_selection.py`.
 
 import inspect
 from abc import ABC
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -20,6 +21,9 @@ from vllm.model_executor.kernels.linear import (
     ScaledMMLinearKernel,
     init_int8_linear_kernel,
     register_linear_kernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
+    MarlinFP8ScaledMMLinearKernel,
 )
 from vllm.platforms import PlatformEnum
 
@@ -91,6 +95,20 @@ def test_cpu_kernel_accepts_all_configs():
         assert can_impl, (
             f"CPUInt8ScaledMMLinearKernel should accept config {config}: {reason}"
         )
+
+
+def test_fp8_marlin_preserves_raw_bmm_weights() -> None:
+    kernel = object.__new__(MarlinFP8ScaledMMLinearKernel)
+    kernel.block_quant = False
+    layer = SimpleNamespace(is_bmm=True)
+
+    with patch(
+        "vllm.model_executor.kernels.linear.scaled_mm.marlin."
+        "prepare_fp8_layer_for_marlin"
+    ) as prepare:
+        kernel.process_weights_after_loading(layer)
+
+    prepare.assert_not_called()
 
 
 class OOTInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
