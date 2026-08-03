@@ -1142,6 +1142,22 @@ def sm80_measured_decode_lengths_are_full(
     return earliest_context_lower_bound >= 4 * 512
 
 
+def sm80_measured_decode_launch_enabled(
+    can_use_measured_decode: bool,
+    causal: bool,
+    num_decodes: int,
+    lengths_are_full: bool,
+    full_decode_cudagraph: bool,
+) -> bool:
+    """Enable an eager full-length launch or pin it into a FULL decode graph."""
+    return (
+        can_use_measured_decode
+        and causal
+        and num_decodes > 0
+        and (lengths_are_full or full_decode_cudagraph)
+    )
+
+
 @triton.jit
 def _sparse_attn_prefill_ragged_kernel(
     q_ptr,
@@ -2034,7 +2050,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
-    sm80_measured_decode_lengths_are_full: bool = False,
+    sm80_measured_decode_launch_enabled: bool = False,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert main_cache.ndim == 3, (
@@ -2163,7 +2179,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     )
     if (
         decode_dispatch is SparseDecodeDispatch.SM80_SPLIT_K
-        and sm80_measured_decode_lengths_are_full
+        and sm80_measured_decode_launch_enabled
     ):
         shape = SparseDecodeShape(
             num_queries=num_queries,
@@ -2275,7 +2291,7 @@ def _rocm_sparse_attn_decode_triton(
     main_ragged_indptr: torch.Tensor | None = None,
     extra_ragged_indices: torch.Tensor | None = None,
     extra_ragged_indptr: torch.Tensor | None = None,
-    sm80_measured_decode_lengths_are_full: bool = False,
+    sm80_measured_decode_launch_enabled: bool = False,
 ) -> torch.Tensor:
     if main_ragged_indices is None or main_ragged_indptr is None:
         main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
@@ -2311,7 +2327,7 @@ def _rocm_sparse_attn_decode_triton(
         extra_cache=extra_cache,
         extra_indices=extra_ragged_indices,
         extra_indptr=extra_ragged_indptr,
-        sm80_measured_decode_lengths_are_full=(sm80_measured_decode_lengths_are_full),
+        sm80_measured_decode_launch_enabled=sm80_measured_decode_launch_enabled,
     )
 
 
@@ -2383,7 +2399,7 @@ def rocm_sparse_attn_decode(
     nope_head_dim: int,
     rope_head_dim: int,
     output: torch.Tensor,
-    sm80_measured_decode_lengths_are_full: bool = False,
+    sm80_measured_decode_launch_enabled: bool = False,
 ) -> None:
     assert swa_k_cache.dtype == torch.uint8, (
         "ROCm Triton sparse decode expects uint8 fp8_ds_mla SWA cache, "
@@ -2429,6 +2445,6 @@ def rocm_sparse_attn_decode(
         main_ragged_indptr=swa_ragged_indptr,
         extra_ragged_indices=topk_ragged_indices,
         extra_ragged_indptr=topk_ragged_indptr,
-        sm80_measured_decode_lengths_are_full=(sm80_measured_decode_lengths_are_full),
+        sm80_measured_decode_launch_enabled=sm80_measured_decode_launch_enabled,
     )
     output.copy_(attn_out.to(output.dtype))

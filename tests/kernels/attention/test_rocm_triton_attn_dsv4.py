@@ -34,6 +34,23 @@ requires_split_decode_arch = pytest.mark.skipif(
     reason="split-K decode path not selected on this architecture",
 )
 
+
+def _on_measured_sm80() -> bool:
+    try:
+        return (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(80)
+            and current_platform.num_compute_units() == 108
+        )
+    except Exception:
+        return False
+
+
+requires_measured_sm80 = pytest.mark.skipif(
+    not _on_measured_sm80(),
+    reason="requires the measured 108-SM CUDA 8.0 target",
+)
+
 NOPE_HEAD_DIM = 448
 ROPE_HEAD_DIM = 64
 HEAD_DIM = NOPE_HEAD_DIM + ROPE_HEAD_DIM
@@ -118,6 +135,33 @@ def _pack_fp8_ds_mla_cache(
         block_size=block_size,
         use_fnuz=use_fnuz,
     )
+    return cache
+
+
+def _pack_unscaled_fp8_ds_mla_cache(
+    kv: torch.Tensor, block_size: int, use_fnuz: bool
+) -> torch.Tensor:
+    """Pack a test cache without importing the model/native cache writer."""
+    num_tokens = kv.shape[0]
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    cache = torch.zeros(
+        (num_blocks, block_size, 584), dtype=torch.uint8, device=kv.device
+    )
+    cache_flat = cache.flatten()
+    fp8_dtype = torch.float8_e4m3fnuz if use_fnuz else torch.float8_e4m3fn
+    nope = kv[:, :NOPE_HEAD_DIM].to(fp8_dtype).view(torch.uint8)
+    rope = kv[:, NOPE_HEAD_DIM:].contiguous().view(torch.uint8)
+    for slot in range(num_tokens):
+        block_idx = slot // block_size
+        pos = slot % block_size
+        block_base = block_idx * cache.stride(0)
+        token_base = block_base + pos * 576
+        scale_base = block_base + block_size * 576 + pos * 8
+        cache_flat[token_base : token_base + NOPE_HEAD_DIM].copy_(nope[slot])
+        cache_flat[token_base + NOPE_HEAD_DIM : token_base + NOPE_HEAD_DIM + 128].copy_(
+            rope[slot]
+        )
+        cache_flat[scale_base : scale_base + 7] = 127
     return cache
 
 
@@ -495,6 +539,75 @@ def test_sparse_attn_decode_split_k_kernel(
         main_rows=main_rows,
         scale=scale,
         attn_sink=attn_sink,
+        block_size=block_size,
+        extra_cache=extra_cache,
+        extra_rows=extra_rows,
+        main_use_fnuz=main_use_fnuz,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@requires_measured_sm80
+@pytest.mark.parametrize("num_queries", [64, 128])
+@torch.inference_mode()
+def test_measured_sm80_decode_launch_is_safe_for_short_graph_replay(
+    num_queries: int,
+) -> None:
+    """Full graphs reuse the measured launch when replay rows become shorter."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    device = torch.device("cuda")
+    torch.manual_seed(17)
+    block_size = 4
+    num_heads = 8
+    main_use_fnuz = current_platform.is_fp8_fnuz()
+
+    main_rows = [[0, 1] if row % 2 == 0 else [1] for row in range(num_queries)]
+    extra_rows = [[2, 3, 4] if row % 2 == 0 else [4, 2] for row in range(num_queries)]
+    main_kv = torch.randn(8, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    extra_kv = torch.randn(8, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    main_cache = _pack_unscaled_fp8_ds_mla_cache(
+        main_kv, block_size, use_fnuz=main_use_fnuz
+    )
+    extra_cache = _pack_unscaled_fp8_ds_mla_cache(extra_kv, block_size, use_fnuz=False)
+
+    main_ragged, main_indptr = _ragged_from_rows(main_rows, device)
+    extra_ragged, extra_indptr = _ragged_from_rows(extra_rows, device)
+    graph_main_ragged = torch.zeros(num_queries * 128, dtype=torch.int32, device=device)
+    graph_extra_ragged = torch.zeros(
+        num_queries * 512, dtype=torch.int32, device=device
+    )
+    graph_main_ragged[: main_ragged.numel()].copy_(main_ragged)
+    graph_extra_ragged[: extra_ragged.numel()].copy_(extra_ragged)
+
+    q = (
+        torch.randn(
+            num_queries, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+        * 0.125
+    )
+    scale = HEAD_DIM**-0.5
+    actual = mod._rocm_sparse_attn_decode_ragged_triton(
+        q=q,
+        main_cache=main_cache,
+        main_indices=graph_main_ragged,
+        main_indptr=main_indptr,
+        scale=scale,
+        attn_sink=None,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        extra_cache=extra_cache,
+        extra_indices=graph_extra_ragged,
+        extra_indptr=extra_indptr,
+        sm80_measured_decode_launch_enabled=True,
+    )
+    expected = _ref_sparse_decode_ragged(
+        q=q,
+        main_cache=main_cache,
+        main_rows=main_rows,
+        scale=scale,
+        attn_sink=None,
         block_size=block_size,
         extra_cache=extra_cache,
         extra_rows=extra_rows,

@@ -243,20 +243,19 @@ def test_measured_table_is_exact_shape_and_device_bound(monkeypatch) -> None:
 
 def test_a100_measured_table_contains_only_confirmed_shapes() -> None:
     expected = {
-        (1, 8, 128, 512, 108): SparseDecodeLaunchConfig(4, 32, 20, 8),
-        (8, 8, 128, 512, 108): SparseDecodeLaunchConfig(8, 32, 10, 8),
-        (32, 8, 128, 512, 108): SparseDecodeLaunchConfig(8, 32, 6, 4),
         (64, 8, 128, 512, 108): SparseDecodeLaunchConfig(8, 32, 3, 4),
         (128, 8, 128, 512, 108): SparseDecodeLaunchConfig(8, 32, 4, 8),
     }
     assert expected == policy.SM80_MEASURED_LAUNCHES
 
-    for num_queries in (2, 4, 16):
+    # Current production-layout A/B regresses at q=1/8/32, so those shapes must
+    # remain on the deployed fallback along with every other unmeasured batch.
+    for num_queries in (1, 2, 4, 8, 16, 32):
         shape = _a100_shape(num_queries)
         fallback = policy.safe_sm80_sparse_decode_launch(shape)
         assert policy.get_sm80_sparse_decode_launch(shape) == fallback
 
-    measured = _a100_shape(8)
+    measured = _a100_shape(64)
     for miss in (
         replace(measured, num_heads=16),
         replace(measured, avg_main_len=256.0),
@@ -288,7 +287,7 @@ def _capture_sm80_wrapper_launch(
     num_queries: int,
     *,
     extra_numel: int | None = None,
-    lengths_are_full: bool | None = True,
+    measured_launch_enabled: bool | None = True,
     dispatch: SparseDecodeDispatch = SparseDecodeDispatch.SM80_SPLIT_K,
 ) -> tuple[tuple[int, ...], dict[str, object]]:
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
@@ -324,8 +323,8 @@ def _capture_sm80_wrapper_launch(
     extra_indptr = torch.empty(num_queries + 1, dtype=torch.int32, device=device)
 
     kwargs = {}
-    if lengths_are_full is not None:
-        kwargs["sm80_measured_decode_lengths_are_full"] = lengths_are_full
+    if measured_launch_enabled is not None:
+        kwargs["sm80_measured_decode_launch_enabled"] = measured_launch_enabled
     mod._rocm_sparse_attn_decode_ragged_triton(
         q=q,
         main_cache=main_cache,
@@ -346,7 +345,7 @@ def _capture_sm80_wrapper_launch(
     return partial.calls[0]
 
 
-@pytest.mark.parametrize("num_queries", [1, 8, 32])
+@pytest.mark.parametrize("num_queries", [64, 128])
 def test_sm80_wrapper_launches_measured_table_config(
     monkeypatch: pytest.MonkeyPatch, num_queries: int
 ) -> None:
@@ -368,38 +367,48 @@ def test_sm80_wrapper_launches_measured_table_config(
 def test_sm80_wrapper_requires_full_length_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    grid, launch = _capture_sm80_wrapper_launch(monkeypatch, 8, lengths_are_full=False)
+    num_queries = 64
+    fallback = policy.safe_sm80_sparse_decode_launch(_a100_shape(num_queries))
+    grid, launch = _capture_sm80_wrapper_launch(
+        monkeypatch, num_queries, measured_launch_enabled=False
+    )
 
-    assert grid == (8, 8, 1)
-    assert launch["BLOCK_H"] == 16
-    assert launch["NUM_SPLITS"] == 8
-    assert launch["num_warps"] == 8
+    assert grid == (num_queries, fallback.num_splits, 1)
+    assert launch["BLOCK_H"] == fallback.block_h
+    assert launch["NUM_SPLITS"] == fallback.num_splits
+    assert launch["num_warps"] == fallback.num_warps
 
 
 def test_sm80_direct_ragged_call_without_proof_retains_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    grid, launch = _capture_sm80_wrapper_launch(monkeypatch, 8, lengths_are_full=None)
+    num_queries = 64
+    fallback = policy.safe_sm80_sparse_decode_launch(_a100_shape(num_queries))
+    grid, launch = _capture_sm80_wrapper_launch(
+        monkeypatch, num_queries, measured_launch_enabled=None
+    )
 
-    assert grid == (8, 8, 1)
-    assert launch["BLOCK_H"] == 16
-    assert launch["NUM_SPLITS"] == 8
+    assert grid == (num_queries, fallback.num_splits, 1)
+    assert launch["BLOCK_H"] == fallback.block_h
+    assert launch["NUM_SPLITS"] == fallback.num_splits
 
 
-@pytest.mark.parametrize("lengths_are_full", [False, True])
+@pytest.mark.parametrize("measured_launch_enabled", [False, True])
 def test_legacy_wrapper_ignores_sm80_length_proof(
-    monkeypatch: pytest.MonkeyPatch, lengths_are_full: bool
+    monkeypatch: pytest.MonkeyPatch, measured_launch_enabled: bool
 ) -> None:
+    num_queries = 64
+    fallback = policy.safe_sm80_sparse_decode_launch(_a100_shape(num_queries))
     grid, launch = _capture_sm80_wrapper_launch(
         monkeypatch,
-        8,
-        lengths_are_full=lengths_are_full,
+        num_queries,
+        measured_launch_enabled=measured_launch_enabled,
         dispatch=SparseDecodeDispatch.LEGACY_SPLIT_K,
     )
 
-    assert grid == (8, 8, 1)
-    assert launch["BLOCK_H"] == 16
-    assert launch["NUM_SPLITS"] == 8
+    assert grid == (num_queries, fallback.num_splits, 1)
+    assert launch["BLOCK_H"] == fallback.block_h
+    assert launch["NUM_SPLITS"] == fallback.num_splits
 
 
 @pytest.mark.parametrize("context_len", [131072, 262144])
@@ -421,21 +430,21 @@ def test_sm80_uneven_or_short_rows_retain_wrapper_fallback(
 ) -> None:
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
 
-    seq_lens_cpu = torch.tensor(
-        [131072, 131072, 2048, 131072, 131072, 131072, 131072, 131072],
-        dtype=torch.int32,
-    )
+    num_queries = 64
+    seq_lens_cpu = torch.full((num_queries,), 131072, dtype=torch.int32)
+    seq_lens_cpu[2] = 2048
     lengths_are_full = mod.sm80_measured_decode_lengths_are_full(
-        seq_lens_cpu, 8, max_query_len=1
+        seq_lens_cpu, num_queries, max_query_len=1
     )
     assert not lengths_are_full
 
+    fallback = policy.safe_sm80_sparse_decode_launch(_a100_shape(num_queries))
     grid, launch = _capture_sm80_wrapper_launch(
-        monkeypatch, 8, lengths_are_full=lengths_are_full
+        monkeypatch, num_queries, measured_launch_enabled=lengths_are_full
     )
-    assert grid == (8, 8, 1)
-    assert launch["BLOCK_H"] == 16
-    assert launch["NUM_SPLITS"] == 8
+    assert grid == (num_queries, fallback.num_splits, 1)
+    assert launch["BLOCK_H"] == fallback.block_h
+    assert launch["NUM_SPLITS"] == fallback.num_splits
 
     assert not mod.sm80_measured_decode_lengths_are_full(None, 8, 1)
     assert not mod.sm80_measured_decode_lengths_are_full(
@@ -443,18 +452,75 @@ def test_sm80_uneven_or_short_rows_retain_wrapper_fallback(
     )
 
 
-def test_sm80_wrapper_fractional_q8_length_misses_table(
+def test_sm80_wrapper_fractional_q64_length_misses_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    num_queries = 64
     grid, launch = _capture_sm80_wrapper_launch(
         monkeypatch,
-        8,
-        extra_numel=8 * 511 + 4,
+        num_queries,
+        extra_numel=num_queries * 511 + num_queries // 2,
     )
-    shape = replace(_a100_shape(8), avg_extra_len=511.5)
+    shape = replace(_a100_shape(num_queries), avg_extra_len=511.5)
     fallback = policy.safe_sm80_sparse_decode_launch(shape)
 
-    assert grid == (8, fallback.num_splits, 1)
+    assert grid == (num_queries, fallback.num_splits, 1)
     assert launch["BLOCK_H"] == fallback.block_h
     assert launch["NUM_SPLITS"] == fallback.num_splits
     assert launch["num_warps"] == fallback.num_warps
+
+
+@pytest.mark.parametrize("context_len", [131072, 262144])
+@pytest.mark.parametrize("num_queries", [1, 8, 32, 64, 128])
+def test_default_full_cudagraph_capture_uses_qualified_sm80_launch(
+    monkeypatch: pytest.MonkeyPatch, context_len: int, num_queries: int
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.config.vllm import OPTIMIZATION_LEVEL_02
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    assert (
+        OPTIMIZATION_LEVEL_02["compilation_config"]["cudagraph_mode"]
+        == CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    assert CUDAGraphMode.FULL_AND_PIECEWISE.decode_mode() == CUDAGraphMode.FULL
+
+    measured_launch_enabled = mod.sm80_measured_decode_launch_enabled(
+        can_use_measured_decode=True,
+        causal=True,
+        num_decodes=num_queries,
+        lengths_are_full=False,
+        full_decode_cudagraph=True,
+    )
+    assert measured_launch_enabled
+    assert not mod.sm80_measured_decode_launch_enabled(
+        can_use_measured_decode=True,
+        causal=True,
+        num_decodes=num_queries,
+        lengths_are_full=False,
+        full_decode_cudagraph=False,
+    )
+
+    runtime_seq_lens = torch.full((num_queries,), context_len, dtype=torch.int32)
+    assert mod.sm80_measured_decode_lengths_are_full(
+        runtime_seq_lens, num_queries, max_query_len=1
+    )
+
+    grid, launch = _capture_sm80_wrapper_launch(
+        monkeypatch,
+        num_queries,
+        measured_launch_enabled=measured_launch_enabled,
+    )
+    shape = _a100_shape(num_queries)
+    expected = policy.SM80_MEASURED_LAUNCHES.get(
+        (num_queries, 8, 128, 512, 108),
+        policy.safe_sm80_sparse_decode_launch(shape),
+    )
+    assert grid == (
+        num_queries,
+        expected.num_splits,
+        math.ceil(8 / expected.block_h),
+    )
+    assert launch["BLOCK_H"] == expected.block_h
+    assert launch["NUM_SPLITS"] == expected.num_splits
+    assert launch["num_warps"] == expected.num_warps
