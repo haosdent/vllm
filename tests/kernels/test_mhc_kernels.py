@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 import vllm.model_executor.kernels.mhc  # noqa: F401
+import vllm.model_executor.kernels.mhc.tilelang as mhc_tilelang
 from vllm.model_executor.kernels.mhc.tilelang import (
+    _can_use_sm80_cublas_hc_prenorm_gemm,
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
 )
@@ -13,6 +17,53 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 DEVICE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "dtype", "n_splits", "use_default_config", "expected"),
+    [
+        (31, torch.bfloat16, 1, True, False),
+        (32, torch.bfloat16, 1, True, True),
+        (2048, torch.bfloat16, 1, True, True),
+        (2048, torch.float16, 1, True, False),
+        (2048, torch.bfloat16, 2, True, False),
+        (2048, torch.bfloat16, 1, False, False),
+    ],
+)
+def test_sm80_cublas_prenorm_routing(
+    monkeypatch,
+    num_tokens,
+    dtype,
+    n_splits,
+    use_default_config,
+    expected,
+):
+    fake_platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability=lambda capability: capability == 80,
+    )
+    monkeypatch.setattr(mhc_tilelang, "current_platform", fake_platform)
+    x = torch.empty((num_tokens, 16), dtype=dtype, device="cpu")
+
+    assert (
+        _can_use_sm80_cublas_hc_prenorm_gemm(
+            x,
+            n_splits=n_splits,
+            use_default_config=use_default_config,
+        )
+        is expected
+    )
+
+
+def test_cublas_prenorm_routing_rejects_non_sm80(monkeypatch):
+    fake_platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability=lambda capability: False,
+    )
+    monkeypatch.setattr(mhc_tilelang, "current_platform", fake_platform)
+    x = torch.empty((2048, 16), dtype=torch.bfloat16, device="cpu")
+
+    assert not _can_use_sm80_cublas_hc_prenorm_gemm(x, 1, True)
 
 
 def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
@@ -157,13 +208,19 @@ def test_mhc_pre_tilelang(num_tokens, hidden_size, hc_mult):
     ("num_tokens", "hidden_size"),
     [
         (1, 1280),
+        (31, 1280),
+        (32, 1280),
         (512, 1280),
         (2048, 1280),
         (1, 4096),
+        (31, 4096),
+        (32, 4096),
         (64, 4096),
         (512, 4096),
         (2048, 4096),
         (1, 7168),
+        (31, 7168),
+        (32, 7168),
         (64, 7168),
         (512, 7168),
         (2048, 7168),
@@ -185,7 +242,12 @@ def test_hc_prenorm_gemm_tilelang(num_tokens, hidden_size):
     _torch_hc_prenorm_gemm(x, fn, out_ref, sqrsum_ref)
     _tilelang_hc_prenorm_gemm(x, fn, out, sqrsum, hidden_size, hc_mult)
 
-    torch.testing.assert_close(out, out_ref, atol=1e-5, rtol=1e-4)
+    if _can_use_sm80_cublas_hc_prenorm_gemm(x, 1, True):
+        # The SM80 route rounds only the static projection weight to BF16.
+        scale = float(out_ref.abs().max())
+        torch.testing.assert_close(out, out_ref, atol=5e-3 * scale, rtol=5e-3)
+    else:
+        torch.testing.assert_close(out, out_ref, atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(sqrsum, sqrsum_ref, atol=8.0, rtol=5e-4)
 
 
