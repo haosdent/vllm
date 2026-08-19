@@ -172,7 +172,9 @@ class TestArgConverter:
 
 class TestThinkTagAbsorption:
     def test_bare_think_end_not_leaked(self, mock_tokenizer):
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
         chunks = ["</think>", "Here is the direct answer."]
         reasoning, content = simulate_reasoning_streaming(parser, chunks)
         assert reasoning == ""
@@ -199,7 +201,9 @@ class TestThinkTagAbsorption:
 
 class TestMissingInvokeEnd:
     def test_non_streaming(self, mock_tokenizer, mock_request):
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
         text = (
             f"{DSML_TOOL_START}"
             f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
@@ -215,7 +219,9 @@ class TestMissingInvokeEnd:
         assert args == {"location": "NYC"}
 
     def test_streaming_with_trailing_content(self, mock_tokenizer, mock_request):
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
         chunks = [
             DSML_TOOL_START,
             f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
@@ -252,7 +258,9 @@ class TestMissingToolStart:
         return _make_tool("get_weather", {"location": {"type": "string"}})
 
     def _declared_parser(self, mock_tokenizer, mock_request, *tools):
-        parser = DeepSeekV4Parser(mock_tokenizer, tools=list(tools))
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, tools=list(tools), chat_template_kwargs={"thinking": False}
+        )
         mock_request.tools = list(tools)
         return parser
 
@@ -367,7 +375,9 @@ class TestMissingToolStart:
         assert result.tool_calls[1].function.name == "get_time"
 
     def test_plain_content_unaffected(self, mock_tokenizer, mock_request):
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
         text = 'Use <invoke name="foo"> style tags to call tools.'
         result = parser.extract_tool_calls(text, mock_request)
 
@@ -378,7 +388,9 @@ class TestMissingToolStart:
     def test_partial_marker_mention_stays_content(self, mock_tokenizer, mock_request):
         """A DSML-like fragment that never completes the invoke marker
         must be flushed as content, not swallowed."""
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
         text = "The prefix <｜DSML｜invoke is reserved."
         result = parser.extract_tool_calls(text, mock_request)
 
@@ -391,7 +403,9 @@ class TestMissingToolStart:
         """An invoke inside the V3.2-style function_calls wrapper stays
         plain content: the orphan fallback must not fire inside a
         foreign wrapper."""
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
         text = _tool_calls(
             _invoke("get_weather", ("location", "true", "NYC")),
         ).replace("tool_calls", "function_calls")
@@ -406,7 +420,9 @@ class TestMissingToolStart:
     ):
         """A foreign wrapper that never closes must not disable native
         tool parsing: the token backed tool_calls wrapper still wins."""
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
         text = (
             DSML_FOREIGN_TOOL_START
             + "\nStray foreign text.\n"
@@ -426,7 +442,9 @@ class TestMissingToolStart:
     ):
         """A request that declared no tools can never accept a recovered
         name, so the orphan invoke stays plain content."""
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
         text = self._orphan_invoke()
         result = parser.extract_tool_calls(text, mock_request)
 
@@ -457,7 +475,9 @@ class TestOrphanInvokeNameValidation:
         return _make_tool("get_weather", {"location": {"type": "string"}})
 
     def _declared_parser(self, mock_tokenizer, mock_request, *tools):
-        parser = DeepSeekV4Parser(mock_tokenizer, tools=list(tools))
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, tools=list(tools), chat_template_kwargs={"thinking": False}
+        )
         mock_request.tools = list(tools)
         return parser
 
@@ -526,7 +546,9 @@ class TestOrphanInvokeNameValidation:
         assert DSML_INVOKE_PREFIX + "made_up_tool" in result.content
 
     def test_no_tools_name_with_space_stays_content(self, mock_tokenizer, mock_request):
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
         text = DSML_INVOKE_PREFIX + "not a name" + DSML_INVOKE_NAME_END + " more text."
         result = parser.extract_tool_calls(text, mock_request)
 
@@ -534,7 +556,9 @@ class TestOrphanInvokeNameValidation:
         assert result.content == text
 
     def test_no_tools_empty_name_stays_content(self, mock_tokenizer, mock_request):
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
         text = DSML_INVOKE_PREFIX + DSML_INVOKE_NAME_END + " more text."
         result = parser.extract_tool_calls(text, mock_request)
 
@@ -1042,9 +1066,23 @@ class TestThinkingModeConfig:
         )
         assert p.parser_engine_config.initial_state.name == "REASONING"
 
-    def test_no_thinking_kwarg_defaults_to_content(self, mock_tokenizer):
+    def test_no_thinking_kwarg_defaults_to_reasoning(self, mock_tokenizer):
+        """Omitted thinking kwargs mean thinking mode (the 0731 contract).
+
+        Must match the tokenizer's apply_chat_template default: the template
+        renders an open <think> block for such requests, so a parser starting
+        in CONTENT would stream the model's reasoning out as content.
+        """
         p = DeepSeekV4Parser(mock_tokenizer)
+        assert p.parser_engine_config.initial_state.name == "REASONING"
+
+    def test_explicit_thinking_false_starts_in_content(self, mock_tokenizer):
+        p = DeepSeekV4Parser(mock_tokenizer, chat_template_kwargs={"thinking": False})
         assert p.parser_engine_config.initial_state.name == "CONTENT"
+
+    def test_empty_chat_template_kwargs_defaults_to_reasoning(self, mock_tokenizer):
+        p = DeepSeekV4Parser(mock_tokenizer, chat_template_kwargs={})
+        assert p.parser_engine_config.initial_state.name == "REASONING"
 
     def test_thinking_mode_reasoning_without_tags(self, mock_tokenizer):
         parser = DeepSeekV4Parser(
@@ -1162,7 +1200,9 @@ class TestImplicitReasoningEnd:
         assert args == {"location": "NYC"}
 
     def test_thinking_false_explicit_think_then_tool_call(self, mock_tokenizer):
-        parser = DeepSeekV4Parser(mock_tokenizer)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, chat_template_kwargs={"thinking": False}
+        )
         chunks = [
             DSML_THINK_START,
             "Let me check the weather.",
@@ -1386,7 +1426,9 @@ class TestParallelUnwrapping:
         expected,
     ):
         tools = [weather_tool, time_tool]
-        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, tools=tools, chat_template_kwargs={"thinking": False}
+        )
         mock_request.tools = tools
 
         text = _tool_calls(
@@ -1409,7 +1451,9 @@ class TestParallelUnwrapping:
         self, mock_tokenizer, mock_request, weather_tool, time_tool
     ):
         tools = [weather_tool, time_tool]
-        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, tools=tools, chat_template_kwargs={"thinking": False}
+        )
         mock_request.tools = tools
 
         chunks = [
@@ -1438,7 +1482,9 @@ class TestParallelUnwrapping:
         self, mock_tokenizer, mock_request, weather_tool, time_tool
     ):
         tools = [weather_tool, time_tool]
-        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, tools=tools, chat_template_kwargs={"thinking": False}
+        )
         mock_request.tools = tools
 
         text = _tool_calls(
@@ -1460,7 +1506,9 @@ class TestParallelUnwrapping:
     def test_unwrap_single_tool_still_works(self, mock_tokenizer, mock_request):
         tool = _make_tool("get_weather", {"location": {"type": "string"}})
         tools = [tool]
-        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, tools=tools, chat_template_kwargs={"thinking": False}
+        )
         mock_request.tools = tools
 
         text = _tool_calls(
@@ -1488,7 +1536,9 @@ class TestStreamingWrapperConsistency:
     def test_streaming_wrapper_unwrap_consistency(self, mock_tokenizer, mock_request):
         tool = _make_tool("get_weather", {"location": {"type": "string"}})
         tools = [tool]
-        parser = DeepSeekV4Parser(mock_tokenizer, tools=tools)
+        parser = DeepSeekV4Parser(
+            mock_tokenizer, tools=tools, chat_template_kwargs={"thinking": False}
+        )
         mock_request.tools = tools
 
         chunks = [

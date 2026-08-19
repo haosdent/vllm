@@ -254,10 +254,18 @@ class DeepSeekV4Parser(ParserEngine):
         **kwargs,
     ) -> None:
         chat_kwargs = kwargs.pop("chat_template_kwargs", None) or {}
-        thinking = (
-            bool(chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking"))
-            and chat_kwargs.get("reasoning_effort") != "none"
-        )
+        # Mirror the tokenizer's apply_chat_template default exactly: omitted
+        # thinking/enable_thinking means thinking mode (the 0731 contract).
+        # A parser default that disagrees with the template leaves the state
+        # machine in CONTENT while the model is inside an open <think> block,
+        # so reasoning streams out as content.
+        if "thinking" in chat_kwargs or "enable_thinking" in chat_kwargs:
+            thinking = bool(
+                chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking")
+            )
+        else:
+            thinking = True
+        thinking = thinking and chat_kwargs.get("reasoning_effort") != "none"
         super().__init__(
             tokenizer,
             tools,
